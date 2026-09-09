@@ -8,7 +8,7 @@ from typing import Any
 from domain_waterfall import http_client
 from domain_waterfall.config import settings
 from domain_waterfall.normalize import extract_domain
-from domain_waterfall.vendors.base import DomainCandidate, TierResult
+from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
 
 _SCHEMA: dict[str, Any] | None = None
 _SCHEMA_FAILED = False
@@ -153,7 +153,13 @@ def _domain_from_organic(item: dict[str, Any]) -> tuple[str, str]:
     return "", ""
 
 
-def resolve_rows(rows: list[dict[str, Any]], *, with_location: bool = True, unit: float = 0.0045) -> TierResult:
+def resolve_rows(
+    rows: list[dict[str, Any]],
+    *,
+    with_location: bool = True,
+    unit: float = 0.0045,
+    on_progress: OnProgress | None = None,
+) -> TierResult:
     inputs = ["company_name"]
     if with_location:
         inputs.extend(["city", "state"])
@@ -172,6 +178,7 @@ def resolve_rows(rows: list[dict[str, Any]], *, with_location: bool = True, unit
             q = f'"{name}" {city} {state}'.strip()
         queries.append({"key": str(row.get("_source_key")), "q": q, "name": name})
 
+    report_progress(on_progress, 0, len(rows), 0)
     # Batch 90–110 per run
     for i in range(0, len(queries), 100):
         chunk = queries[i : i + 100]
@@ -207,4 +214,5 @@ def resolve_rows(rows: list[dict[str, Any]], *, with_location: bool = True, unit
                 billed=True,
                 cost_usd=unit,
             )
+        report_progress(on_progress, min(i + len(chunk), len(rows)), len(rows), len(result.candidates))
     return result

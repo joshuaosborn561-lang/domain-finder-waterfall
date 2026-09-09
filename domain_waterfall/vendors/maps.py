@@ -8,7 +8,7 @@ from urllib.parse import urlencode
 from domain_waterfall import http_client
 from domain_waterfall.config import settings
 from domain_waterfall.normalize import extract_domain
-from domain_waterfall.vendors.base import DomainCandidate, TierResult
+from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
 
 
 def _headers() -> dict[str, str]:
@@ -101,20 +101,28 @@ def _pick_phone(row: dict[str, Any]) -> str:
     return ""
 
 
-def resolve_rows(rows: list[dict[str, Any]], *, with_location: bool = True) -> TierResult:
+def resolve_rows(
+    rows: list[dict[str, Any]],
+    *,
+    with_location: bool = True,
+    on_progress: OnProgress | None = None,
+) -> TierResult:
     result = TierResult(
         tier="maps",
         inputs_passed=["company_name", "city"] if with_location else ["company_name"],
     )
     if not settings.rapidapi_key:
         result.skipped = "maps_key_missing"
+        report_progress(on_progress, 0, len(rows), 0)
         return result
-    for row in rows:
+    total = len(rows)
+    for idx, row in enumerate(rows, start=1):
         key = str(row.get("_source_key"))
         name = str(row.get("company_name") or "").strip()
         city = str(row.get("city") or "").strip() if with_location else ""
         if not name:
             result.none += 1
+            report_progress(on_progress, idx, total, len(result.candidates))
             continue
         query = f"{name} {city}".strip()
         hits = _search(query)
@@ -122,6 +130,7 @@ def resolve_rows(rows: list[dict[str, Any]], *, with_location: bool = True) -> T
         result.billed_calls += 1
         if not hits:
             result.none += 1
+            report_progress(on_progress, idx, total, len(result.candidates))
             continue
         top = hits[0]
         place_id = str(top.get("place_id") or top.get("business_id") or "")
@@ -132,6 +141,7 @@ def resolve_rows(rows: list[dict[str, Any]], *, with_location: bool = True) -> T
         domain = _pick_domain(merged)
         if not domain:
             result.none += 1
+            report_progress(on_progress, idx, total, len(result.candidates))
             continue
         result.candidates[key] = DomainCandidate(
             domain=domain,
@@ -144,4 +154,5 @@ def resolve_rows(rows: list[dict[str, Any]], *, with_location: bool = True) -> T
             raw={"maps_score_ignored": True},
             inputs_passed=result.inputs_passed,
         )
+        report_progress(on_progress, idx, total, len(result.candidates))
     return result

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable
 
 from . import supabase as sb
@@ -12,9 +13,38 @@ from .pricing import DEFAULT_PIPELINE, compute_order, estimate_rows
 from .profiles import ClientProfile, get_profile
 from .source import TableSource, ensure_writeback, fetch_source_rows, parse_source, patch_source_row
 from .vendors import aiark, cache, discolike, leadmagic, maps, prospeo, serp
-from .vendors.base import DomainCandidate, TierResult
+from .vendors.base import DomainCandidate, OnProgress, TierResult
 
 ProgressFn = Callable[[dict[str, Any]], None]
+
+
+def make_row_ticker(
+    emit: Callable[[dict[str, Any]], None],
+    *,
+    min_interval_s: float = 2.0,
+    clock: Callable[[], float] = time.monotonic,
+) -> OnProgress:
+    """Emit processed/targets/hits. Always on first and last row; otherwise throttle."""
+    last = 0.0
+    started = False
+
+    def tick(processed: int, total: int, hits: int) -> None:
+        nonlocal last, started
+        now = clock()
+        done = total > 0 and processed >= total
+        if started and not done and now - last < min_interval_s:
+            return
+        started = True
+        last = now
+        emit(
+            {
+                "processed": processed,
+                "targets": total,
+                "hits": hits,
+            }
+        )
+
+    return tick
 
 FREE_ALWAYS = frozenset({"cache", "maps"})
 FREE_ON_MISS = frozenset({"prospeo"})
@@ -105,23 +135,46 @@ def _run_tier(
     with_location: bool,
     units: dict[str, float],
     guessed: dict[str, str],
+    on_progress: OnProgress | None = None,
 ) -> TierResult:
     if name == "cache":
-        return cache.lookup_many(rows, extra_tables=profile.cache_tables)
+        return cache.lookup_many(
+            rows, extra_tables=profile.cache_tables, on_progress=on_progress
+        )
     if name == "maps":
-        return maps.resolve_rows(rows, with_location=with_location)
+        return maps.resolve_rows(
+            rows, with_location=with_location, on_progress=on_progress
+        )
     if name == "aiark":
         return aiark.resolve_rows(
-            rows, profile, with_location=with_location, unit=units.get("aiark", 0.0005)
+            rows,
+            profile,
+            with_location=with_location,
+            unit=units.get("aiark", 0.0005),
+            on_progress=on_progress,
         )
     if name == "discolike":
-        return discolike.resolve_rows(rows, with_location=with_location)
+        return discolike.resolve_rows(
+            rows, with_location=with_location, on_progress=on_progress
+        )
     if name == "serp":
-        return serp.resolve_rows(rows, with_location=with_location, unit=units.get("serp", 0.0045))
+        return serp.resolve_rows(
+            rows,
+            with_location=with_location,
+            unit=units.get("serp", 0.0045),
+            on_progress=on_progress,
+        )
     if name == "prospeo":
-        return prospeo.resolve_rows(rows, guessed=guessed, unit=units.get("prospeo", 0.015))
+        return prospeo.resolve_rows(
+            rows,
+            guessed=guessed,
+            unit=units.get("prospeo", 0.015),
+            on_progress=on_progress,
+        )
     if name == "leadmagic":
-        return leadmagic.resolve_rows(rows, unit=units.get("leadmagic", 0.015))
+        return leadmagic.resolve_rows(
+            rows, unit=units.get("leadmagic", 0.015), on_progress=on_progress
+        )
     out = TierResult(tier=name)
     out.skipped = "unknown_tier"
     return out
@@ -262,7 +315,18 @@ def resolve_domain(
             emit({"phase": "cost_gate", "stopped_before": tier_name, "would_cost_usd": round(projected, 4)})
             break
 
-        emit({"phase": "tier", "tier": tier_name, "targets": len(targets)})
+        emit(
+            {
+                "phase": "tier",
+                "tier": tier_name,
+                "targets": len(targets),
+                "processed": 0,
+                "hits": 0,
+            }
+        )
+        ticker = make_row_ticker(
+            lambda extra: emit({"phase": "tier", "tier": tier_name, **extra})
+        )
         result = _run_tier(
             tier_name,
             targets,
@@ -270,6 +334,7 @@ def resolve_domain(
             with_location=with_location,
             units=units,
             guessed=guessed,
+            on_progress=ticker,
         )
         spent += result.cost_usd
 

@@ -10,7 +10,7 @@ from typing import Any
 from domain_waterfall import http_client
 from domain_waterfall.config import settings
 from domain_waterfall.normalize import extract_domain
-from domain_waterfall.vendors.base import DomainCandidate, TierResult
+from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
 
 BASE = "https://api.discolike.com/v1"
 UNIT = 0.00425
@@ -20,16 +20,24 @@ def _headers() -> dict[str, str]:
     return {"x-discolike-key": settings.discolike_api_key, "Accept": "application/json"}
 
 
-def resolve_rows(rows: list[dict[str, Any]], *, with_location: bool = True) -> TierResult:
+def resolve_rows(
+    rows: list[dict[str, Any]],
+    *,
+    with_location: bool = True,
+    on_progress: OnProgress | None = None,
+) -> TierResult:
     inputs = ["company_name"]
     if with_location:
         inputs.extend(["city", "state", "country", "phone"])
     result = TierResult(tier="discolike", inputs_passed=inputs)
     if not settings.discolike_api_key:
         result.skipped = "discolike_key_missing"
+        report_progress(on_progress, 0, len(rows), 0)
         return result
     if not rows:
+        report_progress(on_progress, 0, 0, 0)
         return result
+    report_progress(on_progress, 0, len(rows), 0)
 
     buf = io.StringIO()
     fieldnames = ["row_key", "name", "city", "state", "country", "phone", "zip"]
@@ -90,6 +98,7 @@ def resolve_rows(rows: list[dict[str, Any]], *, with_location: bool = True) -> T
 
     results: list[dict[str, Any]] = []
     for _ in range(60):
+        report_progress(on_progress, 0, len(rows), 0)
         time.sleep(2)
         st = http_client.get(
             "discolike",
@@ -146,4 +155,5 @@ def resolve_rows(rows: list[dict[str, Any]], *, with_location: bool = True) -> T
     result.billed_calls = len(rows)
     result.cost_usd = UNIT * len(rows)
     result.none = len(rows) - len(result.candidates)
+    report_progress(on_progress, len(rows), len(rows), len(result.candidates))
     return result

@@ -7,7 +7,7 @@ from typing import Any
 from domain_waterfall import http_client
 from domain_waterfall.config import settings
 from domain_waterfall.normalize import extract_domain
-from domain_waterfall.vendors.base import DomainCandidate, TierResult
+from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
 
 BASE = "https://api.prospeo.io"
 BATCH = 25
@@ -54,12 +54,14 @@ def resolve_rows(
     *,
     guessed: dict[str, str] | None = None,
     unit: float = 0.015,
+    on_progress: OnProgress | None = None,
 ) -> TierResult:
     result = TierResult(tier="prospeo", inputs_passed=["company_name"])
     if not settings.prospeo_api_key:
         result.skipped = "prospeo_key_missing"
         return result
     guessed = guessed or {}
+    report_progress(on_progress, 0, len(rows), 0)
     for i in range(0, len(rows), BATCH):
         chunk = rows[i : i + BATCH]
         payload = []
@@ -125,4 +127,5 @@ def resolve_rows(
         result.cost_usd += credits * unit
         result.billed_calls += int(credits)
         result.none += len(chunk) - len(found_keys)
+        report_progress(on_progress, min(i + len(chunk), len(rows)), len(rows), len(result.candidates))
     return result
