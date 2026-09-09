@@ -105,6 +105,21 @@ def receipt_test(
         per_tier = []
         guessed: dict[str, str] = {}
         for tier_name in order.tiers:
+            def _tick(processed: int, total: int, hits: int, *, _tier: str = tier_name) -> None:
+                if progress:
+                    progress(
+                        {
+                            "status": "running",
+                            "phase": "tier",
+                            "tier": _tier,
+                            "processed": processed,
+                            "targets": total,
+                            "hits": hits,
+                            "with_location": with_location,
+                            "client_tag": profile.client_tag,
+                        }
+                    )
+
             result = _run_tier(
                 tier_name,
                 sample,
@@ -112,6 +127,7 @@ def receipt_test(
                 with_location=with_location,
                 units=units,
                 guessed=guessed,
+                on_progress=_tick,
             )
             hits = wrong = none = 0
             for row in sample:

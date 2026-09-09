@@ -8,7 +8,7 @@ from typing import Any
 from domain_waterfall import http_client
 from domain_waterfall.config import settings
 from domain_waterfall.normalize import extract_domain
-from domain_waterfall.vendors.base import DomainCandidate, TierResult
+from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
 
 BASE = "https://api.leadmagic.io"
 
@@ -69,7 +69,12 @@ def _parse_company(body: dict[str, Any]) -> tuple[str, str, str, str]:
     return domain, name, state, phone
 
 
-def resolve_rows(rows: list[dict[str, Any]], *, unit: float = 0.015) -> TierResult:
+def resolve_rows(
+    rows: list[dict[str, Any]],
+    *,
+    unit: float = 0.015,
+    on_progress: OnProgress | None = None,
+) -> TierResult:
     result = TierResult(tier="leadmagic", inputs_passed=["company_name"])
     if not settings.leadmagic_api_key:
         result.skipped = "leadmagic_key_missing"
@@ -79,7 +84,9 @@ def resolve_rows(rows: list[dict[str, Any]], *, unit: float = 0.015) -> TierResu
         for r in rows
         if r.get("company_name")
     ]
+    report_progress(on_progress, 0, len(rows), 0)
     if not payload_rows:
+        report_progress(on_progress, len(rows), len(rows), 0)
         return result
 
     # Small/medium jobs: inline JSON. Avoids the fileUrl download-header trap.
@@ -104,7 +111,7 @@ def resolve_rows(rows: list[dict[str, Any]], *, unit: float = 0.015) -> TierResu
             or ""
         )
     if job_id:
-        items = _poll_bulk(job_id)
+        items = _poll_bulk(job_id, on_progress=on_progress, total=len(rows))
         found = 0
         for item in items:
             ident = str(item.get("identifier") or item.get("input_identifier") or "")
@@ -130,14 +137,17 @@ def resolve_rows(rows: list[dict[str, Any]], *, unit: float = 0.015) -> TierResu
         result.cost_usd = found * unit
         result.credits = float(found)
         result.none = len(payload_rows) - found
+        report_progress(on_progress, len(rows), len(rows), len(result.candidates))
         return result
 
     # Fallback: single enrich_company (1 credit / match, free miss)
-    for row in rows:
+    total = len(rows)
+    for idx, row in enumerate(rows, start=1):
         key = str(row.get("_source_key"))
         name = str(row.get("company_name") or "").strip()
         if not name:
             result.none += 1
+            report_progress(on_progress, idx, total, len(result.candidates))
             continue
         sr = http_client.post(
             "leadmagic",
@@ -149,19 +159,23 @@ def resolve_rows(rows: list[dict[str, Any]], *, unit: float = 0.015) -> TierResu
         result.calls += 1
         if sr is None or sr.status_code >= 400:
             result.none += 1
+            report_progress(on_progress, idx, total, len(result.candidates))
             continue
         try:
             body = sr.json()
         except ValueError:
             result.none += 1
+            report_progress(on_progress, idx, total, len(result.candidates))
             continue
         if not isinstance(body, dict):
             result.none += 1
+            report_progress(on_progress, idx, total, len(result.candidates))
             continue
         msg = str(body.get("message") or "").lower()
         domain, vname, state, phone = _parse_company(body)
         if not domain or "not found" in msg:
             result.none += 1
+            report_progress(on_progress, idx, total, len(result.candidates))
             continue
         result.candidates[key] = DomainCandidate(
             domain=domain,
@@ -176,11 +190,17 @@ def resolve_rows(rows: list[dict[str, Any]], *, unit: float = 0.015) -> TierResu
         result.billed_calls += 1
         result.cost_usd += unit
         result.credits += 1
+        report_progress(on_progress, idx, total, len(result.candidates))
     return result
 
 
-def _poll_bulk(job_id: str) -> list[dict[str, Any]]:
+def _poll_bulk(
+    job_id: str,
+    on_progress: OnProgress | None = None,
+    total: int = 0,
+) -> list[dict[str, Any]]:
     for _ in range(40):
+        report_progress(on_progress, 0, total, 0)
         time.sleep(3)
         st = http_client.get(
             "leadmagic",

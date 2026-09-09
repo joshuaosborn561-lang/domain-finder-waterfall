@@ -1,7 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
+
+OnProgress = Callable[[int, int, int], None]
+
+
+def report_progress(
+    on_progress: OnProgress | None, processed: int, total: int, hits: int
+) -> None:
+    if on_progress:
+        on_progress(processed, total, hits)
 
 
 @dataclass
