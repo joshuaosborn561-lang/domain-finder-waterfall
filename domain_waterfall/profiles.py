@@ -72,6 +72,35 @@ class ClientProfile:
         return bool(self.geo.get("geo_required", True))
 
     @property
+    def geo_in_query(self) -> bool:
+        return bool(self.geo.get("geo_in_query", False))
+
+    @property
+    def min_confidence(self) -> float:
+        val = self.raw.get("min_confidence", 0.25)
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return 0.25
+
+    @property
+    def explicit_tier_order(self) -> list[str]:
+        raw = self.raw.get("tier_order")
+        if not isinstance(raw, list):
+            return []
+        out: list[str] = []
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                out.append(item.strip())
+            elif isinstance(item, dict) and item.get("tier"):
+                out.append(str(item["tier"]).strip())
+        return out
+
+    @property
+    def tier_order_frozen(self) -> bool:
+        return bool(self.raw.get("tier_order_frozen", False))
+
+    @property
     def name_strip_tokens(self) -> list[str]:
         tokens = self.raw.get("name_strip_tokens")
         if not tokens:
@@ -157,6 +186,7 @@ class ClientProfile:
             area_codes=self.area_codes,
             states=self.states,
             geo_required=self.geo_required,
+            min_confidence=self.min_confidence,
         )
 
     def to_public(self) -> dict[str, Any]:

@@ -28,6 +28,23 @@ def test_zero_yield_dropped() -> None:
     assert "discolike" not in order.tiers
 
 
+def test_explicit_tier_order_is_frozen() -> None:
+    order = compute_order(
+        ["cache", "maps", "discolike", "prospeo", "aiark", "serp", "leadmagic"],
+        live_units={"discolike": 0.00425, "prospeo": 0.015, "aiark": 0.0005, "serp": 0.0045},
+        explicit_order=["maps", "discolike", "prospeo", "aiark", "serp", "cache", "leadmagic"],
+    )
+    assert order.tiers == [
+        "maps",
+        "discolike",
+        "prospeo",
+        "aiark",
+        "serp",
+        "cache",
+        "leadmagic",
+    ]
+
+
 def test_estimate_free_zero() -> None:
     order = compute_order(["cache", "maps", "discolike"], live_units={"discolike": 0.00425})
     est = estimate_rows(25, order)

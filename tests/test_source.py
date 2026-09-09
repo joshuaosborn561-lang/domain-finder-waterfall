@@ -1,6 +1,6 @@
 import pytest
 
-from domain_waterfall.source import parse_source, where_to_filters
+from domain_waterfall.source import FetchResult, parse_source, where_to_filters
 from domain_waterfall.supabase import filter_write_fields
 
 
@@ -28,6 +28,26 @@ def test_request_helper_does_not_shadow_urllib() -> None:
 
     assert hasattr(sb.urllib_request, "Request")
     assert callable(sb.request)
+
+
+def test_fetch_result_fails_on_unexplained_loss() -> None:
+    ok = FetchResult(
+        rows=[{}],
+        rows_matched=10,
+        rows_fetched=8,
+        rows_excluded=2,
+        exclusion_reasons={"job_limit": 2},
+    )
+    ok.assert_explained()
+    bad = FetchResult(
+        rows=[{}],
+        rows_matched=10,
+        rows_fetched=8,
+        rows_excluded=2,
+        exclusion_reasons={"job_limit": 1},
+    )
+    with pytest.raises(ValueError, match="unexplained row loss"):
+        bad.assert_explained()
 
 
 def test_write_allowlist() -> None:

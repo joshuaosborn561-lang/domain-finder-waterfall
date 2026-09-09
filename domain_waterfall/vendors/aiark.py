@@ -8,7 +8,7 @@ from domain_waterfall import http_client
 from domain_waterfall.config import settings
 from domain_waterfall.normalize import e164_us, extract_domain
 from domain_waterfall.profiles import ClientProfile
-from domain_waterfall.vendors.base import DomainCandidate, TierResult
+from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
 
 BASE = "https://api.ai-ark.com/api/developer-portal"
 
@@ -72,6 +72,7 @@ def resolve_rows(
     *,
     with_location: bool = True,
     unit: float = 0.0005,
+    on_progress: OnProgress | None = None,
 ) -> TierResult:
     inputs = ["company_name"]
     if with_location:
@@ -81,12 +82,15 @@ def resolve_rows(
     result = TierResult(tier="aiark", inputs_passed=inputs)
     if not settings.ai_ark_api_key:
         result.skipped = "aiark_key_missing"
+        report_progress(on_progress, 0, len(rows), 0)
         return result
-    for row in rows:
+    total = len(rows)
+    for idx, row in enumerate(rows, start=1):
         key = str(row.get("_source_key"))
         name = str(row.get("company_name") or "").strip()
         if not name:
             result.none += 1
+            report_progress(on_progress, idx, total, len(result.candidates))
             continue
         account: dict[str, Any] = {
             "name": {"any": {"include": {"mode": "SMART", "content": [name]}}},
@@ -127,6 +131,7 @@ def resolve_rows(
         result.billed_calls += 1 if hits else 0
         if not hits:
             result.none += 1
+            report_progress(on_progress, idx, total, len(result.candidates))
             continue
         top = hits[0]
         summary = top.get("summary") if isinstance(top.get("summary"), dict) else {}
@@ -136,6 +141,7 @@ def resolve_rows(
         domain = extract_domain(str(link.get("domain") or link.get("website") or ""))
         if not domain:
             result.none += 1
+            report_progress(on_progress, idx, total, len(result.candidates))
             continue
         result.candidates[key] = DomainCandidate(
             domain=domain,
@@ -150,4 +156,5 @@ def resolve_rows(
             cost_usd=unit if hits else 0.0,
             credits=0.1 if hits else 0.0,
         )
+        report_progress(on_progress, idx, total, len(result.candidates))
     return result

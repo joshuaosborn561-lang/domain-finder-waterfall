@@ -260,7 +260,7 @@ def resolve_domain(
     )
 )
 def get_job_status(job_id: str) -> str:
-    """Last known progress on a long job. Never a bare error."""
+    """Last known progress on a long job. Includes processed/targets/hits mid-tier. Never a bare error."""
     from mcp_server.jobs import get_job
 
     return _json(get_job(job_id))
