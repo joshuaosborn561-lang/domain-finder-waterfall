@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from urllib import error, request
+from urllib import error
+from urllib import request as urllib_request
 
 from .config import load_settings
 
@@ -54,9 +55,9 @@ def request_on(
     headers = _headers(key, prefer=prefer)
     if extra_headers:
         headers.update(extra_headers)
-    req = request.Request(endpoint, data=data, headers=headers, method=method)
+    req = urllib_request.Request(endpoint, data=data, headers=headers, method=method)
     try:
-        with request.urlopen(req, timeout=120) as resp:
+        with urllib_request.urlopen(req, timeout=120) as resp:
             return resp.status, resp.read().decode("utf-8", errors="replace")
     except error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")

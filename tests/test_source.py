@@ -23,6 +23,13 @@ def test_parse_source_table() -> None:
     assert src.table == "gc_adjudication"
 
 
+def test_request_helper_does_not_shadow_urllib() -> None:
+    from domain_waterfall import supabase as sb
+
+    assert hasattr(sb.urllib_request, "Request")
+    assert callable(sb.request)
+
+
 def test_write_allowlist() -> None:
     out = filter_write_fields(
         {
