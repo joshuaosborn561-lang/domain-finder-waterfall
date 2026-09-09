@@ -46,11 +46,16 @@ python -m mcp_server
 
 ## Railway
 
+Public Claude connector:
+
+- MCP: `https://domain-waterfall-production.up.railway.app/mcp`
+- Health: `https://domain-waterfall-production.up.railway.app/health`
+
 ```bash
+unset RAILWAY_TOKEN
 railway init --name domain-waterfall
 railway up
 railway domain
-railway variables set MCP_TRANSPORT=streamable-http SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=…
 ```
 
-Dockerfile binds `HOST=0.0.0.0` / `PORT`. Health: `GET /health`. MCP: `/mcp`.
+Set vendor keys and `SUPABASE_URL` / `SUPABASE_ANON_KEY` (or service role) on the service. Do not put a personal Railway API token in the service env. Dockerfile binds `HOST=0.0.0.0` / `PORT`.
