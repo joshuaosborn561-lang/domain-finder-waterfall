@@ -71,7 +71,9 @@ PETERSON_ROOF = {
         "center_lng": -96.7970,
         "radius_mi": 80,
         "geo_required": True,
+        "geo_in_query": False,
     },
+    "min_confidence": 0.25,
     "name_strip_tokens": [
         "inc",
         "llc",
@@ -102,15 +104,34 @@ PETERSON_ROOF = {
     },
     "domain_cache_tables": ["gc.companies"],
     "second_opinion": False,
+    "tier_order_frozen": True,
     "enabled_tiers": [
-        "cache",
         "maps",
-        "aiark",
         "discolike",
-        "serp",
         "prospeo",
+        "aiark",
+        "serp",
+        "cache",
         "leadmagic",
     ],
+    "tier_order": [
+        "maps",
+        "discolike",
+        "prospeo",
+        "aiark",
+        "serp",
+        "cache",
+        "leadmagic",
+    ],
+    "hit_rates": {
+        "maps": 0.84,
+        "discolike": 0.4,
+        "prospeo": 0.04,
+        "aiark": 0.0,
+        "serp": 0.04,
+        "cache": 0.0,
+        "leadmagic": 0.0,
+    },
 }
 
 GOLIATH = {
@@ -125,6 +146,7 @@ GOLIATH = {
         "center_lng": None,
         "radius_mi": None,
         "geo_required": False,
+        "geo_in_query": False,
     },
     "name_strip_tokens": [
         "inc",

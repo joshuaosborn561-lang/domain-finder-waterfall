@@ -6,7 +6,11 @@ def test_profiles_differ_only_in_json() -> None:
     p = ClientProfile("peterson_roof", "Peterson", PETERSON_ROOF)
     g = ClientProfile("goliath", "Goliath", GOLIATH)
     assert p.geo_required is True
+    assert p.geo_in_query is False
     assert g.geo_required is False
+    assert g.geo_in_query is False
+    assert p.explicit_tier_order[:5] == ["maps", "discolike", "prospeo", "aiark", "serp"]
+    assert p.tier_order_frozen is True
     assert p.industry_reject_regex
     assert g.industry_reject_regex is None
     assert p.states == ["TX"]

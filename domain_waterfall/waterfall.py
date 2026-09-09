@@ -11,7 +11,14 @@ from .gate import evaluate, sink_map
 from .normalize import extract_domain, normalize_name
 from .pricing import DEFAULT_PIPELINE, compute_order, estimate_rows
 from .profiles import ClientProfile, get_profile
-from .source import TableSource, ensure_writeback, fetch_source_rows, parse_source, patch_source_row
+from .source import (
+    TableSource,
+    defer_unfetched,
+    ensure_writeback,
+    fetch_source_rows,
+    parse_source,
+    patch_source_row,
+)
 from .vendors import aiark, cache, discolike, leadmagic, maps, prospeo, serp
 from .vendors.base import DomainCandidate, OnProgress, TierResult
 
@@ -155,7 +162,7 @@ def _run_tier(
         )
     if name == "discolike":
         return discolike.resolve_rows(
-            rows, with_location=with_location, on_progress=on_progress
+            rows, with_location=True, on_progress=on_progress
         )
     if name == "serp":
         return serp.resolve_rows(
@@ -217,13 +224,16 @@ def resolve_domain(
         live_units=units,
         measured_hit_rates=profile.hit_rates,
         dropped=profile.dropped_tiers,
+        explicit_order=profile.explicit_tier_order,
     )
     if max_tier:
         stop = max_tier.strip().lower()
         if stop in order.tiers:
             order.tiers = order.tiers[: order.tiers.index(stop) + 1]
 
-    rows = fetch_source_rows(src)
+    fetched = fetch_source_rows(src)
+    census = fetched.to_public()
+    rows = fetched.rows
     n = len(rows)
     estimate = estimate_rows(n, order)
     estimate["live_units"] = {k: order.prices[k].unit for k in order.tiers}
@@ -235,12 +245,17 @@ def resolve_domain(
     estimate["client_tag"] = profile.client_tag
     estimate["source_table"] = src.qualified
     estimate["where"] = src.where
+    estimate.update(census)
     if estimate_only:
         return {"ok": True, "estimate_only": True, **estimate}
 
     if writeback:
         ensure_writeback(src)
+        if fetched.exclusion_reasons.get("job_limit"):
+            deferred_n = defer_unfetched(src, [str(r["_source_key"]) for r in rows])
+            census = {**census, "deferred_unfetched": deferred_n}
 
+    query_location = profile.geo_in_query
     pending = {str(r["_source_key"]): r for r in rows}
     states: dict[str, dict[str, Any]] = {
         str(r["_source_key"]): {
@@ -269,6 +284,7 @@ def resolve_domain(
             "client_tag": profile.client_tag,
             "source_table": src.qualified,
             "rows": n,
+            **census,
             "spent_usd": round(spent, 4),
             "resolved": sum(1 for s in states.values() if s["status"] == "resolved"),
             "review": sum(1 for s in states.values() if s["status"] == "review"),
@@ -331,7 +347,7 @@ def resolve_domain(
             tier_name,
             targets,
             profile,
-            with_location=with_location,
+            with_location=query_location,
             units=units,
             guessed=guessed,
             on_progress=ticker,
@@ -418,6 +434,7 @@ def resolve_domain(
                 "inputs_passed": result.inputs_passed,
                 "skipped": result.skipped,
                 "error": result.error,
+                "cache_key": "company_name_normalized" if tier_name == "cache" else None,
             }
         )
         emit({"phase": "tier_done", "tier": tier_name})
@@ -477,6 +494,7 @@ def resolve_domain(
         "source_table": src.qualified,
         "where": src.where,
         "rows": n,
+        **census,
         "spent_usd": round(spent, 4),
         "approve_cost_usd": approve_cost_usd,
         "counts": counts,

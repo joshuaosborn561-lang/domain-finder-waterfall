@@ -114,6 +114,7 @@ def compute_order(
     live_units: dict[str, float] | None = None,
     measured_hit_rates: dict[str, float] | None = None,
     dropped: list[str] | None = None,
+    explicit_order: list[str] | None = None,
 ) -> TierOrder:
     live_units = live_units or {}
     measured = measured_hit_rates or {}
@@ -146,7 +147,12 @@ def compute_order(
         hit = p.hit_rate if p.hit_rate is not None else 0.0
         return (p.sort_cost, -hit, n)
 
-    names.sort(key=_key)
+    if explicit_order:
+        ordered = [n for n in explicit_order if n in prices]
+        ordered += [n for n in names if n not in ordered]
+        names = ordered
+    else:
+        names.sort(key=_key)
     return TierOrder(tiers=names, prices=prices)
 
 

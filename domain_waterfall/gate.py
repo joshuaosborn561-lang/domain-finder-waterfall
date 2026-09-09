@@ -64,6 +64,7 @@ class ProfileGate:
     area_codes: list[str] = field(default_factory=list)
     states: list[str] = field(default_factory=list)
     geo_required: bool = True
+    min_confidence: float = 0.25
 
     @property
     def blocklist(self) -> set[str]:

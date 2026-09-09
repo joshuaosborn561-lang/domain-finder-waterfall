@@ -68,22 +68,22 @@ def lookup_many(
     extra_tables: list[str] | None = None,
     on_progress: OnProgress | None = None,
 ) -> TierResult:
+    # Cache key is normalized company name only. City/state are never part of the join.
     names = [str(r.get("company_name") or "") for r in rows]
     report_progress(on_progress, 0, len(rows), 0)
     keyed = lookup_cache(names, extra_tables=extra_tables)
-    # Re-key by source key for the waterfall.
-    out = TierResult(tier="cache", inputs_passed=keyed.inputs_passed)
-    name_to_key = {
-        str(r.get("company_name") or ""): str(r.get("_source_key"))
-        for r in rows
-        if r.get("_source_key") is not None
-    }
-    for name, cand in keyed.candidates.items():
-        key = name_to_key.get(name)
-        if key is None:
+    by_norm: dict[str, DomainCandidate] = {}
+    for raw_name, cand in keyed.candidates.items():
+        by_norm[normalize_name(raw_name)] = cand
+    out = TierResult(tier="cache", inputs_passed=["company_name_normalized"])
+    for row in rows:
+        key = str(row.get("_source_key"))
+        norm = normalize_name(str(row.get("company_name") or ""))
+        cand = by_norm.get(norm)
+        if not cand:
+            out.none += 1
             continue
-        out.candidates[str(key)] = cand
-    out.none = keyed.none
+        out.candidates[key] = cand
     out.calls = keyed.calls
     report_progress(on_progress, len(rows), len(rows), len(out.candidates))
     return out

@@ -63,7 +63,8 @@ def receipt_test(
     where = str(gt.get("where") or "")
     src = parse_source(table, where, limit=max(n * 80, 2000))
     src.column_map.setdefault("domain", "domain")
-    raw_rows = fetch_source_rows(src)
+    fetched = fetch_source_rows(src)
+    raw_rows = fetched.rows
     truth_rows = _attach_truth_domains(src, raw_rows)
     truth_rows = _filter_receipt_rows(truth_rows, profile)
     if not truth_rows:
@@ -82,6 +83,7 @@ def receipt_test(
         live_units=units,
         measured_hit_rates=profile.hit_rates,
         dropped=profile.dropped_tiers,
+        explicit_order=profile.explicit_tier_order,
     )
     estimate = estimate_rows(len(sample), order)
     estimate["live_units"] = {k: order.prices[k].unit for k in order.tiers}
@@ -98,6 +100,7 @@ def receipt_test(
                 "n": len(sample),
                 "estimated_usd": estimate["estimated_usd"],
                 "client_tag": profile.client_tag,
+                **fetched.to_public(),
             }
         )
 
@@ -167,6 +170,7 @@ def receipt_test(
                     "skipped": result.skipped,
                     "error": result.error,
                     "with_location": with_location,
+                    "cache_key": "company_name_normalized" if tier_name == "cache" else None,
                 }
             )
             if progress:
@@ -192,7 +196,11 @@ def receipt_test(
         if row.get("skipped") or row.get("error"):
             continue
         hit_rates[row["tier"]] = row["hit_rate"]
-        if row["hits"] == 0 and row["tier"] not in dropped:
+        if (
+            not profile.tier_order_frozen
+            and row["hits"] == 0
+            and row["tier"] not in dropped
+        ):
             dropped.append(row["tier"])
 
     new_order = compute_order(
@@ -200,22 +208,21 @@ def receipt_test(
         live_units=units,
         measured_hit_rates=hit_rates,
         dropped=dropped,
+        explicit_order=profile.explicit_tier_order,
     )
     if persist:
-        update_profile_fields(
-            profile.client_tag,
-            {
-                "dropped_tiers": dropped,
-                "hit_rates": hit_rates,
-                "tier_order": new_order.as_profile(),
-            },
-        )
+        patch: dict[str, Any] = {"hit_rates": hit_rates}
+        if not profile.tier_order_frozen:
+            patch["dropped_tiers"] = dropped
+            patch["tier_order"] = new_order.as_profile()
+        update_profile_fields(profile.client_tag, patch)
 
     return {
         "ok": True,
         "client_tag": profile.client_tag,
         "n": len(sample),
         "ground_truth": {"table": src.qualified, "where": where},
+        **fetched.to_public(),
         "estimate": estimate,
         "spent_usd": round(sum(t["cost_usd"] for t in with_geo + without_geo), 4),
         "with_location": with_geo,

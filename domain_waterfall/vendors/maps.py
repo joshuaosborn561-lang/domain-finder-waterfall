@@ -132,6 +132,7 @@ def resolve_rows(
             result.none += 1
             report_progress(on_progress, idx, total, len(result.candidates))
             continue
+        # Ranking is used; RapidAPI score is ignored. Gate decides at min_confidence=0.25.
         top = hits[0]
         place_id = str(top.get("place_id") or top.get("business_id") or "")
         detail = _details(place_id) if place_id else {}

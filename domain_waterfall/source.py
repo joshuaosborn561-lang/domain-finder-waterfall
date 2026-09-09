@@ -183,14 +183,84 @@ def _select_list(src: TableSource) -> list[str]:
     return sorted(c for c in cols if c)
 
 
-def fetch_source_rows(src: TableSource) -> list[dict[str, Any]]:
+@dataclass
+class FetchResult:
+    rows: list[dict[str, Any]]
+    rows_matched: int
+    rows_fetched: int
+    rows_excluded: int
+    exclusion_reasons: dict[str, int]
+
+    def to_public(self) -> dict[str, Any]:
+        return {
+            "rows_matched": self.rows_matched,
+            "rows_fetched": self.rows_fetched,
+            "rows_excluded": self.rows_excluded,
+            "exclusion_reasons": dict(self.exclusion_reasons),
+        }
+
+    def assert_explained(self) -> None:
+        explained = sum(self.exclusion_reasons.values())
+        if self.rows_excluded > 0 and explained != self.rows_excluded:
+            raise ValueError(
+                "unexplained row loss: "
+                f"rows_matched={self.rows_matched} rows_fetched={self.rows_fetched} "
+                f"rows_excluded={self.rows_excluded} reasons={self.exclusion_reasons} "
+                f"reasons_sum={explained}"
+            )
+
+
+def _rpc_rows(data: Any) -> list[Any]:
+    if isinstance(data, dict):
+        data = data.get("dw_read_source") or data.get("data") or data
+    return data if isinstance(data, list) else []
+
+
+def count_source_rows(src: TableSource) -> int:
+    discover_column_map(src)
+    data = sb.rpc(
+        "dw_count_source",
+        {
+            "p_schema": src.schema,
+            "p_table": src.table,
+            "p_filters": where_to_filters(src.where),
+        },
+    )
+    if isinstance(data, int):
+        return data
+    if isinstance(data, dict):
+        val = data.get("dw_count_source")
+        if isinstance(val, int):
+            return val
+    if isinstance(data, list) and data:
+        first = data[0]
+        if isinstance(first, int):
+            return first
+        if isinstance(first, dict):
+            for key in ("dw_count_source", "count", "n"):
+                if isinstance(first.get(key), int):
+                    return int(first[key])
+    try:
+        return int(data)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"dw_count_source returned {type(data).__name__}") from None
+
+
+def fetch_source_rows(src: TableSource) -> FetchResult:
     discover_column_map(src)
     filters = where_to_filters(src.where)
+    matched = count_source_rows(src)
     mapped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    reasons: dict[str, int] = {}
     cursor: str | None = None
-    remaining = src.limit
+    hit_limit = False
+
     while True:
-        page = PAGE_SIZE if remaining is None else min(PAGE_SIZE, remaining)
+        if src.limit is not None and len(mapped) >= src.limit:
+            hit_limit = True
+            break
+        page = PAGE_SIZE
         data = sb.rpc(
             "dw_read_source",
             {
@@ -203,30 +273,79 @@ def fetch_source_rows(src: TableSource) -> list[dict[str, Any]]:
                 "p_limit": page,
             },
         )
-        if isinstance(data, dict):
-            data = data.get("dw_read_source") or data.get("data") or data
-        rows = data if isinstance(data, list) else []
+        rows = _rpc_rows(data)
         if not rows:
             break
         for raw in rows:
             if not isinstance(raw, dict):
                 continue
-            item: dict[str, Any] = {"_source_key": raw.get(src.key_column)}
+            raw_key = raw.get(src.key_column)
+            if raw_key is None or str(raw_key).strip() == "":
+                reasons["missing_source_key"] = reasons.get("missing_source_key", 0) + 1
+                continue
+            key = str(raw_key)
+            cursor = key
+            if key in seen:
+                reasons["duplicate_source_key"] = reasons.get("duplicate_source_key", 0) + 1
+                continue
+            if src.limit is not None and len(mapped) >= src.limit:
+                hit_limit = True
+                break
+            seen.add(key)
+            item: dict[str, Any] = {"_source_key": raw_key}
             for field_name, col in src.column_map.items():
                 item[field_name] = raw.get(col)
             name = str(item.get("company_name") or "").strip()
             if not item.get("company_name_normalized"):
                 item["company_name_normalized"] = normalize_name(name)
             mapped.append(item)
-            if raw.get(src.key_column) is not None:
-                cursor = str(raw.get(src.key_column))
-        if remaining is not None:
-            remaining -= len(rows)
-            if remaining <= 0:
-                break
+        if hit_limit:
+            break
         if len(rows) < page:
             break
-    return mapped
+
+    if src.limit is not None and (hit_limit or len(mapped) >= src.limit):
+        leftover = matched - len(mapped) - sum(reasons.values())
+        if leftover > 0:
+            reasons["job_limit"] = leftover
+            hit_limit = True
+
+    fetched = len(mapped)
+    excluded = matched - fetched
+    if excluded < 0:
+        raise ValueError(
+            f"fetch produced more rows than count(*): matched={matched} fetched={fetched}"
+        )
+    result = FetchResult(
+        rows=mapped,
+        rows_matched=matched,
+        rows_fetched=fetched,
+        rows_excluded=excluded,
+        exclusion_reasons=reasons,
+    )
+    result.assert_explained()
+    return result
+
+
+def defer_unfetched(src: TableSource, keep_keys: list[str]) -> int:
+    data = sb.rpc(
+        "dw_defer_unfetched",
+        {
+            "p_schema": src.schema,
+            "p_table": src.table,
+            "p_filters": where_to_filters(src.where),
+            "p_key_column": src.key_column,
+            "p_keep_keys": [str(k) for k in keep_keys],
+        },
+    )
+    if isinstance(data, int):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("dw_defer_unfetched"), int):
+        return int(data["dw_defer_unfetched"])
+    try:
+        return int(data or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def ensure_writeback(src: TableSource) -> list[str]:
