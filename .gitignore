@@ -1,0 +1,17 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+data/jobs/
+data/locks/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+dist/
+*.egg-info/
