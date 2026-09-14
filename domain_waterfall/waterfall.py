@@ -532,7 +532,11 @@ def resolve_domain(
                 "skipped": result.skipped,
                 "error": result.error,
                 "rows_attempted": len(targets),
-                "rows_done": result.rows_done or (0 if result.error == "tier timeout" else len(targets)),
+                "rows_done": (
+                    result.rows_done
+                    if (result.skipped or result.error)
+                    else (result.rows_done or len(targets))
+                ),
                 "requests_made": result.calls,
                 "cache_key": "company_name_normalized" if tier_name == "cache" else None,
             }
