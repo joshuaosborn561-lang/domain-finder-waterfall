@@ -5,17 +5,19 @@ Maps is free on this plan (RapidAPI quota, unit_usd 0). cost_usd and credits sta
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable
 from urllib.parse import urlencode
 
 from domain_waterfall import http_client
-from domain_waterfall.concurrency import VendorAcquireTimeout, VendorCallTimeout
-from domain_waterfall.config import settings
-from domain_waterfall.normalize import extract_domain
 from domain_waterfall.concurrency import (
+    VendorAcquireTimeout,
+    VendorCallTimeout,
     VendorThrottle,
     VendorTransportError,
 )
+from domain_waterfall.config import settings
+from domain_waterfall.normalize import extract_domain
 from domain_waterfall.tier_pool import (
     RowWorkResult,
     resolve_tier_concurrency,
@@ -53,6 +55,10 @@ def _parse_search_payload(payload: Any) -> list[dict[str, Any]]:
         return [x for x in payload if isinstance(x, dict)]
     if not isinstance(payload, dict):
         return []
+    # Soft throttle bodies often look like {"message": "..."} with no results.
+    for bad in ("message", "error", "errors"):
+        if bad in payload and not any(k in payload for k in ("data", "results", "items")):
+            raise VendorThrottle("maps", f"soft throttle body key {bad}")
     for key in ("data", "results", "items"):
         val = payload.get(key)
         if isinstance(val, list):
@@ -62,7 +68,7 @@ def _parse_search_payload(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _search(query: str) -> list[dict[str, Any]]:
+def _search(query: str, *, empty_retries: int = 1) -> list[dict[str, Any]]:
     params = {
         "query": query,
         "limit": "8",
@@ -72,28 +78,43 @@ def _search(query: str) -> list[dict[str, Any]]:
         "zoom": "13",
     }
     url = f"https://{settings.maps_host}/searchmaps.php?{urlencode(params)}"
-    try:
-        r = _maps_get(url)
-    except VendorThrottle:
-        raise
-    except VendorCallTimeout as exc:
-        raise VendorTransportError("maps", str(exc)) from exc
-    except VendorAcquireTimeout as exc:
-        raise VendorTransportError("maps", str(exc)) from exc
-    if r is None:
-        raise VendorTransportError("maps", "empty response")
-    if r.status_code == 429:
-        raise VendorThrottle("maps", "http 429")
-    if r.status_code >= 500:
-        raise VendorTransportError("maps", f"http {r.status_code}")
-    if r.status_code >= 400:
-        # Client errors are true misses for this query, not transport failures.
-        return []
-    try:
-        payload = r.json()
-    except ValueError as exc:
-        raise VendorTransportError("maps", "bad json") from exc
-    return _parse_search_payload(payload)
+    last_empty = False
+    for attempt in range(max(1, empty_retries)):
+        t0 = time.monotonic()
+        try:
+            r = _maps_get(url)
+        except VendorThrottle:
+            raise
+        except VendorCallTimeout as exc:
+            raise VendorTransportError("maps", str(exc)) from exc
+        except VendorAcquireTimeout as exc:
+            raise VendorTransportError("maps", str(exc)) from exc
+        elapsed = time.monotonic() - t0
+        if r is None:
+            raise VendorTransportError("maps", "empty response")
+        if r.status_code == 429:
+            raise VendorThrottle("maps", "http 429")
+        if r.status_code >= 500:
+            raise VendorTransportError("maps", f"http {r.status_code}")
+        if r.status_code >= 400:
+            # Client errors are true misses for this query, not transport failures.
+            return []
+        try:
+            payload = r.json()
+        except ValueError as exc:
+            raise VendorTransportError("maps", "bad json") from exc
+        try:
+            hits = _parse_search_payload(payload)
+        except VendorThrottle:
+            raise
+        if hits:
+            return hits
+        last_empty = True
+        # Retry empty results once; under load RapidAPI sometimes returns a blank page.
+        if attempt < empty_retries - 1:
+            time.sleep(0.5 * (attempt + 1) + (0.15 if elapsed < 0.5 else 0.0))
+            continue
+    return [] if last_empty else []
 
 
 def _details(place_id: str) -> dict[str, Any]:

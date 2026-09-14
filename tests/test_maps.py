@@ -10,11 +10,11 @@ from domain_waterfall.vendors import maps
 def test_resolve_tier_concurrency_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TIER_CONCURRENCY", raising=False)
     monkeypatch.delenv("MAPS_TIER_CONCURRENCY", raising=False)
-    assert resolve_tier_concurrency("maps") == 12
+    assert resolve_tier_concurrency("maps") == 8
     assert resolve_tier_concurrency("maps", 100) == 32
     assert resolve_tier_concurrency("maps", 1) == 1
-    monkeypatch.setenv("MAPS_TIER_CONCURRENCY", "8")
-    assert resolve_tier_concurrency("maps") == 8
+    monkeypatch.setenv("MAPS_TIER_CONCURRENCY", "12")
+    assert resolve_tier_concurrency("maps") == 12
 
 
 def test_maps_not_configured(monkeypatch: pytest.MonkeyPatch) -> None:

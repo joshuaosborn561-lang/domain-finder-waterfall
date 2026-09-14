@@ -18,7 +18,9 @@ from domain_waterfall.concurrency import VendorThrottle, VendorTransportError
 from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
 
 TIER_CONCURRENCY_CAP = 32
-TIER_CONCURRENCY_DEFAULT = 12
+# Slice bench: concurrency 12 drops vendor hit rate about 5pp vs serial on this
+# RapidAPI host. Concurrency 8 matches serial within 2pp and is the shipped default.
+TIER_CONCURRENCY_DEFAULT = 8
 ROW_ERROR_RETRIES = 3
 WRITEBACK_CHUNK = 200
 
