@@ -1,4 +1,9 @@
-"""Process-wide vendor semaphores. 429 backs off and retries; never disables a tier."""
+"""Process-wide vendor semaphores. 429 backs off and retries; never disables a tier.
+
+Acquire waits are bounded. The semaphore is never held across backoff sleep.
+Each HTTP attempt also has a thread-level hard timeout so a stuck connect/DNS
+cannot pin a tier forever — requests' own timeout does not cover getaddrinfo.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +12,7 @@ import random
 import threading
 import time
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Any, Callable, Iterator, TypeVar
 
 import requests
 
@@ -30,6 +35,31 @@ DEFAULT_VENDOR_LIMITS: dict[str, int] = {
     "cache": 20,
 }
 
+DEFAULT_ACQUIRE_TIMEOUT_S = 10.0
+MAPS_MAX_ATTEMPTS = 1
+
+T = TypeVar("T")
+
+
+class VendorAcquireTimeout(TimeoutError):
+    """Could not take a vendor slot before acquire_timeout."""
+
+    def __init__(self, tier: str, timeout: float) -> None:
+        super().__init__(f"vendor lock timeout: {tier} after {timeout:.1f}s")
+        self.tier = tier
+        self.timeout = timeout
+
+
+class VendorCallTimeout(TimeoutError):
+    """Outbound call exceeded its hard deadline (or requests timed out)."""
+
+    def __init__(self, tier: str, detail: str = "") -> None:
+        msg = f"vendor call timeout: {tier}"
+        if detail:
+            msg = f"{msg}: {detail}"
+        super().__init__(msg)
+        self.tier = tier
+
 
 def _env_int(name: str, default: int) -> int:
     raw = (os.environ.get(name) or "").strip()
@@ -45,6 +75,38 @@ def vendor_concurrency(tier: str) -> int:
     key = TIER_ENV_KEYS.get(tier)
     default = DEFAULT_VENDOR_LIMITS.get(tier, 4)
     return _env_int(key, default) if key else default
+
+
+def timeout_budget_s(timeout: object | None) -> float:
+    if timeout is None:
+        return 15.0
+    if isinstance(timeout, (tuple, list)) and len(timeout) >= 2:
+        return max(0.1, float(timeout[0]) + float(timeout[1]))
+    try:
+        return max(0.1, float(timeout))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 15.0
+
+
+def run_with_timeout(fn: Callable[[], T], seconds: float) -> T:
+    """Run fn in a daemon thread; raise VendorCallTimeout if it exceeds seconds."""
+    box: dict[str, Any] = {}
+    done = threading.Event()
+
+    def _run() -> None:
+        try:
+            box["v"] = fn()
+        except Exception as exc:  # noqa: BLE001
+            box["e"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=_run, name="dw-http", daemon=True).start()
+    if not done.wait(seconds):
+        raise VendorCallTimeout("http", f"exceeded {seconds:.1f}s")
+    if "e" in box:
+        raise box["e"]
+    return box["v"]
 
 
 class VendorGate:
@@ -63,9 +125,14 @@ class VendorGate:
             return self._sems[tier]
 
     @contextmanager
-    def acquire(self, tier: str) -> Iterator[None]:
+    def acquire(self, tier: str, timeout: float | None = DEFAULT_ACQUIRE_TIMEOUT_S) -> Iterator[None]:
         sem = self._sem(tier)
-        sem.acquire()
+        if timeout is None or timeout <= 0:
+            acquired = sem.acquire()
+        else:
+            acquired = sem.acquire(timeout=timeout)
+        if not acquired:
+            raise VendorAcquireTimeout(tier, float(timeout or 0.0))
         try:
             yield
         finally:
@@ -93,22 +160,46 @@ def request_with_retry(
     method: str,
     url: str,
     *,
-    max_attempts: int = 4,
+    max_attempts: int | None = None,
+    acquire_timeout: float | None = DEFAULT_ACQUIRE_TIMEOUT_S,
     **kwargs: object,
 ) -> requests.Response | None:
+    if max_attempts is None:
+        max_attempts = MAPS_MAX_ATTEMPTS if tier == "maps" else 4
     last: requests.Response | None = None
-    with vendor_gate.acquire(tier):
-        for attempt in range(max_attempts):
-            try:
-                last = requests.request(method, url, **kwargs)  # type: ignore[arg-type]
-            except requests.RequestException:
-                if attempt < max_attempts - 1:
-                    time.sleep(_retry_delay(attempt, None))
-                    continue
-                return None
-            if last.status_code == 429 or last.status_code >= 500:
-                if attempt < max_attempts - 1:
-                    time.sleep(_retry_delay(attempt, last))
-                    continue
-            return last
+    timeout = kwargs.get("timeout", 45)
+    hard_s = timeout_budget_s(timeout) + 1.0
+    for attempt in range(max_attempts):
+        try:
+            with vendor_gate.acquire(tier, timeout=acquire_timeout):
+                try:
+                    last = run_with_timeout(
+                        lambda: requests.request(method, url, **kwargs),  # type: ignore[arg-type]
+                        hard_s,
+                    )
+                except VendorCallTimeout as exc:
+                    exc.tier = tier
+                    raise VendorCallTimeout(tier, str(exc)) from exc
+        except VendorAcquireTimeout:
+            raise
+        except VendorCallTimeout:
+            if attempt < max_attempts - 1:
+                time.sleep(_retry_delay(attempt, None))
+                continue
+            raise
+        except requests.Timeout as exc:
+            if attempt < max_attempts - 1:
+                time.sleep(_retry_delay(attempt, None))
+                continue
+            raise VendorCallTimeout(tier, str(exc)) from exc
+        except requests.RequestException:
+            if attempt < max_attempts - 1:
+                time.sleep(_retry_delay(attempt, None))
+                continue
+            return None
+        if last is not None and (last.status_code == 429 or last.status_code >= 500):
+            if attempt < max_attempts - 1:
+                time.sleep(_retry_delay(attempt, last))
+                continue
+        return last
     return last

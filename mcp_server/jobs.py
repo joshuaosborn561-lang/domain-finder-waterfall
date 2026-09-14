@@ -8,11 +8,16 @@ import time
 import traceback
 import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parent.parent
 JOBS_DIR = ROOT / "data" / "jobs"
+
+STALL_SECONDS = 300.0
+STALL_POLL_SECONDS = 15.0
+STALL_REASON = "stalled: no progress for 5 minutes"
 
 
 @dataclass
@@ -33,6 +38,7 @@ class Job:
 
 _lock = threading.Lock()
 _jobs: dict[str, Job] = {}
+_cancels: dict[str, threading.Event] = {}
 
 
 def _path(job_id: str) -> Path:
@@ -42,6 +48,43 @@ def _path(job_id: str) -> Path:
 
 def _persist(job: Job) -> None:
     _path(job.id).write_text(json.dumps(job.to_public(), indent=2, default=str), encoding="utf-8")
+
+
+def is_cancelled(job_id: str) -> bool:
+    ev = _cancels.get(job_id)
+    return bool(ev and ev.is_set())
+
+
+def _parse_progress_ts(job: Job) -> float:
+    raw = (job.result or {}).get("last_progress_at")
+    if isinstance(raw, (int, float)) and raw > 0:
+        return float(raw)
+    if isinstance(raw, str) and raw.strip():
+        text = raw.strip().replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(text).timestamp()
+        except ValueError:
+            pass
+    return float(job.started_at or job.created_at)
+
+
+def request_cancel(job_id: str, reason: str) -> None:
+    ev = _cancels.get(job_id)
+    if ev:
+        ev.set()
+    with _lock:
+        job = _jobs.get(job_id)
+        if job is None or job.status in ("completed", "failed"):
+            return
+        job.status = "failed"
+        job.error = reason
+        snap = dict(job.result or {})
+        snap["status"] = "failed"
+        snap["error"] = reason
+        snap["progress"] = "failed"
+        job.result = snap
+        job.finished_at = time.time()
+    _persist(job)
 
 
 def get_job(job_id: str) -> dict[str, Any]:
@@ -90,12 +133,26 @@ def list_jobs(limit: int = 20) -> list[dict[str, Any]]:
 
 
 def update_job_progress(job_id: str, snapshot: dict[str, Any]) -> None:
+    if is_cancelled(job_id):
+        return
     with _lock:
         job = _jobs.get(job_id)
-        if job is None:
+        if job is None or job.status == "failed":
             return
         job.result = dict(snapshot)
     _persist(job)
+
+
+def _stall_watch(job_id: str, cancel: threading.Event) -> None:
+    while not cancel.wait(STALL_POLL_SECONDS):
+        with _lock:
+            job = _jobs.get(job_id)
+        if job is None or job.status != "running":
+            return
+        age = time.time() - _parse_progress_ts(job)
+        if age >= STALL_SECONDS:
+            request_cancel(job_id, STALL_REASON)
+            return
 
 
 def start_job(
@@ -111,19 +168,35 @@ def start_job(
         meta=meta or {},
         result={"progress": "queued"},
     )
+    cancel = threading.Event()
     with _lock:
         _jobs[job.id] = job
+        _cancels[job.id] = cancel
     _persist(job)
 
     def worker() -> None:
         job.status = "running"
         job.started_at = time.time()
-        job.result = {"progress": "running"}
+        job.result = {
+            "progress": "running",
+            "last_progress_at": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
         _persist(job)
+        threading.Thread(
+            target=_stall_watch, args=(job.id, cancel), name=f"dw-stall-{job.id}", daemon=True
+        ).start()
         try:
-            job.result = fn(job) or {"progress": "completed"}
+            result = fn(job) or {"progress": "completed"}
+            if cancel.is_set() or job.status == "failed":
+                return
+            job.result = result
             job.status = "completed"
         except Exception as exc:  # noqa: BLE001
+            if cancel.is_set() or job.status == "failed":
+                return
             job.status = "failed"
             job.error = f"{type(exc).__name__}: {exc}"
             job.result = {
@@ -132,7 +205,9 @@ def start_job(
                 "traceback": traceback.format_exc()[-2000:],
             }
         finally:
-            job.finished_at = time.time()
+            cancel.set()
+            if job.finished_at is None:
+                job.finished_at = time.time()
             _persist(job)
 
     threading.Thread(target=worker, name=f"dw-job-{job.id}", daemon=True).start()

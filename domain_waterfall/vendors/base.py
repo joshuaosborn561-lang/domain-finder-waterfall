@@ -3,13 +3,28 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-OnProgress = Callable[[int, int, int], None]
+# processed, total, hits[, extra]
+OnProgress = Callable[..., None]
 
 
 def report_progress(
-    on_progress: OnProgress | None, processed: int, total: int, hits: int
+    on_progress: OnProgress | None,
+    processed: int,
+    total: int,
+    hits: int,
+    extra: dict[str, Any] | None = None,
 ) -> None:
-    if on_progress:
+    if not on_progress:
+        return
+    if extra is None:
+        try:
+            on_progress(processed, total, hits)
+        except TypeError:
+            on_progress(processed, total, hits, None)
+        return
+    try:
+        on_progress(processed, total, hits, extra)
+    except TypeError:
         on_progress(processed, total, hits)
 
 
@@ -41,3 +56,4 @@ class TierResult:
     inputs_passed: list[str] = field(default_factory=list)
     error: str | None = None
     skipped: str | None = None
+    rows_done: int = 0

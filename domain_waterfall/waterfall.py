@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from . import supabase as sb
@@ -23,6 +24,55 @@ from .vendors import aiark, cache, discolike, leadmagic, maps, prospeo, serp
 from .vendors.base import DomainCandidate, OnProgress, TierResult
 
 ProgressFn = Callable[[dict[str, Any]], None]
+StopFn = Callable[[], bool]
+
+TIER_MIN_BUDGET_S = 600.0
+TIER_PER_ROW_S = 2.0
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_skip_tiers(raw: Any) -> list[str]:
+    if raw is None or raw is False:
+        return []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            import json
+
+            try:
+                return parse_skip_tiers(json.loads(text))
+            except ValueError:
+                pass
+        return [p.strip().lower() for p in text.split(",") if p.strip()]
+    if isinstance(raw, (list, tuple, set)):
+        return [str(x).strip().lower() for x in raw if str(x).strip()]
+    return []
+
+
+def apply_tier_filters(
+    tiers: list[str],
+    *,
+    min_tier: str = "",
+    skip_tiers: Any = None,
+) -> list[str]:
+    """Drop skipped names and everything before min_tier in the current order."""
+    out = list(tiers)
+    skip = set(parse_skip_tiers(skip_tiers))
+    mt = (min_tier or "").strip().lower()
+    if mt:
+        if mt not in out:
+            raise ValueError(f"min_tier {mt!r} is not in the planned tier order {out}")
+        out = out[out.index(mt) :]
+    return [t for t in out if t not in skip]
+
+
+def tier_budget_seconds(n_rows: int) -> float:
+    return max(TIER_MIN_BUDGET_S, max(0, int(n_rows)) * TIER_PER_ROW_S)
 
 
 def make_row_ticker(
@@ -31,11 +81,16 @@ def make_row_ticker(
     min_interval_s: float = 2.0,
     clock: Callable[[], float] = time.monotonic,
 ) -> OnProgress:
-    """Emit processed/targets/hits. Always on first and last row; otherwise throttle."""
+    """Emit in-tier progress. Always on first and last row; otherwise throttle."""
     last = 0.0
     started = False
 
-    def tick(processed: int, total: int, hits: int) -> None:
+    def tick(
+        processed: int,
+        total: int,
+        hits: int,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
         nonlocal last, started
         now = clock()
         done = total > 0 and processed >= total
@@ -43,11 +98,17 @@ def make_row_ticker(
             return
         started = True
         last = now
+        extra = extra or {}
         emit(
             {
                 "processed": processed,
                 "targets": total,
                 "hits": hits,
+                "rows_attempted": extra.get("rows_attempted", processed),
+                "rows_done": extra.get("rows_done", processed),
+                "accepted": extra.get("accepted", hits),
+                "requests_made": extra.get("requests_made", 0),
+                "last_progress_at": utc_now_iso(),
             }
         )
 
@@ -143,6 +204,8 @@ def _run_tier(
     units: dict[str, float],
     guessed: dict[str, str],
     on_progress: OnProgress | None = None,
+    deadline: float | None = None,
+    should_stop: StopFn | None = None,
 ) -> TierResult:
     if name == "cache":
         return cache.lookup_many(
@@ -150,7 +213,11 @@ def _run_tier(
         )
     if name == "maps":
         return maps.resolve_rows(
-            rows, with_location=with_location, on_progress=on_progress
+            rows,
+            with_location=with_location,
+            on_progress=on_progress,
+            deadline=deadline,
+            should_stop=should_stop,
         )
     if name == "aiark":
         return aiark.resolve_rows(
@@ -208,12 +275,15 @@ def resolve_domain(
     where: str,
     client_tag: str,
     max_tier: str = "",
+    min_tier: str = "",
+    skip_tiers: Any = None,
     approve_cost_usd: float | None = None,
     estimate_only: bool = False,
     with_location: bool = True,
     progress: ProgressFn | None = None,
     writeback: bool = True,
     limit: int | None = None,
+    should_stop: StopFn | None = None,
 ) -> dict[str, Any]:
     hydrate_keys()
     profile = get_profile(client_tag)
@@ -249,6 +319,11 @@ def resolve_domain(
     if estimate_only:
         return {"ok": True, "estimate_only": True, **estimate}
 
+    # min_tier / skip_tiers apply to the real run only. Estimate stays complete.
+    order.tiers = apply_tier_filters(
+        order.tiers, min_tier=min_tier, skip_tiers=skip_tiers
+    )
+
     if writeback:
         ensure_writeback(src)
         if fetched.exclusion_reasons.get("job_limit"):
@@ -276,6 +351,9 @@ def resolve_domain(
     tier_stats: list[dict[str, Any]] = []
     guessed: dict[str, str] = {}
 
+    def stopped() -> bool:
+        return bool(should_stop and should_stop())
+
     def emit(extra: dict[str, Any] | None = None) -> None:
         if not progress:
             return
@@ -291,14 +369,22 @@ def resolve_domain(
             "deferred": sum(1 for s in states.values() if s["status"] == "deferred"),
             "unresolved": sum(1 for s in states.values() if s["status"] in (None, "domain_unresolved")),
             "tiers": tier_stats,
+            "last_progress_at": utc_now_iso(),
         }
         if extra:
             snap.update(extra)
+        if "last_progress_at" not in (extra or {}):
+            snap["last_progress_at"] = utc_now_iso()
         progress(snap)
 
     emit({"phase": "start", "estimate_usd": estimate["estimated_usd"]})
 
+    cancelled = False
     for tier_name in order.tiers:
+        if stopped():
+            cancelled = True
+            emit({"phase": "cancelled", "error": "cancelled", "status": "failed"})
+            break
         price = order.prices[tier_name]
         is_paid = (not price.free) and price.unit > 0 and not price.free_on_miss
         is_free_on_miss = price.free_on_miss
@@ -331,6 +417,8 @@ def resolve_domain(
             emit({"phase": "cost_gate", "stopped_before": tier_name, "would_cost_usd": round(projected, 4)})
             break
 
+        budget_s = tier_budget_seconds(len(targets))
+        deadline = time.monotonic() + budget_s
         emit(
             {
                 "phase": "tier",
@@ -338,10 +426,15 @@ def resolve_domain(
                 "targets": len(targets),
                 "processed": 0,
                 "hits": 0,
+                "rows_attempted": 0,
+                "rows_done": 0,
+                "accepted": 0,
+                "requests_made": 0,
+                "tier_budget_s": budget_s,
             }
         )
         ticker = make_row_ticker(
-            lambda extra: emit({"phase": "tier", "tier": tier_name, **extra})
+            lambda extra, _tier=tier_name: emit({"phase": "tier", "tier": _tier, **extra})
         )
         result = _run_tier(
             tier_name,
@@ -351,7 +444,11 @@ def resolve_domain(
             units=units,
             guessed=guessed,
             on_progress=ticker,
+            deadline=deadline,
+            should_stop=lambda d=deadline: stopped() or time.monotonic() >= d,
         )
+        if not result.error and time.monotonic() >= deadline:
+            result.error = "tier timeout"
         spent += result.cost_usd
 
         accepted_rows: list[dict[str, Any]] = []
@@ -434,10 +531,22 @@ def resolve_domain(
                 "inputs_passed": result.inputs_passed,
                 "skipped": result.skipped,
                 "error": result.error,
+                "rows_attempted": len(targets),
+                "rows_done": result.rows_done or (0 if result.error == "tier timeout" else len(targets)),
+                "requests_made": result.calls,
                 "cache_key": "company_name_normalized" if tier_name == "cache" else None,
             }
         )
-        emit({"phase": "tier_done", "tier": tier_name})
+        emit(
+            {
+                "phase": "tier_done",
+                "tier": tier_name,
+                "rows_attempted": len(targets),
+                "rows_done": result.rows_done,
+                "accepted": accepted,
+                "requests_made": result.calls,
+            }
+        )
 
     counts = {
         "resolved": 0,
@@ -447,7 +556,11 @@ def resolve_domain(
         "agreement": 0,
         "at_or_above_0_7": 0,
     }
+    write_i = 0
     for key, st in states.items():
+        if stopped():
+            cancelled = True
+            break
         if st["status"] is None:
             st["status"] = "domain_unresolved"
         counts[st["status"]] = counts.get(st["status"], 0) + 1
@@ -455,6 +568,9 @@ def resolve_domain(
             counts["agreement"] += 1
         if (st.get("confidence") or 0) >= 0.7 and st["status"] == "resolved":
             counts["at_or_above_0_7"] += 1
+        write_i += 1
+        if writeback and (write_i == 1 or write_i % 50 == 0 or write_i == n):
+            emit({"phase": "writeback", "processed": write_i, "targets": n})
         if writeback:
             fields = {
                 "wf_domain": st.get("domain"),
@@ -488,7 +604,7 @@ def resolve_domain(
         next_tier = remaining[0] if remaining else ""
 
     summary = {
-        "ok": True,
+        "ok": not cancelled,
         "estimate_only": False,
         "client_tag": profile.client_tag,
         "source_table": src.qualified,
@@ -506,5 +622,9 @@ def resolve_domain(
         "deferred_stopped_before": deferred_tier or None,
         "live_units": {k: order.prices[k].unit for k in order.tiers},
     }
-    emit({**summary, "status": "completed"})
+    if cancelled:
+        summary["error"] = "cancelled"
+        emit({**summary, "status": "failed"})
+    else:
+        emit({**summary, "status": "completed"})
     return summary

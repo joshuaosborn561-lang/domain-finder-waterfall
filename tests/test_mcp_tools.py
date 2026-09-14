@@ -31,6 +31,8 @@ def test_resolve_has_no_inline_rows() -> None:
     assert "rows" not in params
     assert "estimate_only" in params
     assert "approve_cost_usd" in params
+    assert "min_tier" in params
+    assert "skip_tiers" in params
 
 
 def test_get_job_status_never_raises() -> None:
