@@ -86,7 +86,7 @@ def request_cancel(job_id: str, reason: str, *, status: str = "cancelled") -> di
         job = _jobs.get(job_id)
         if job is None:
             return {"ok": False, "job_id": job_id, "status": "unknown", "error": "job not found"}
-        if _terminal(job.status) and job.status != "running":
+        if _terminal(job.status):
             return job.to_public() | {"ok": True, "job_id": job.id}
         job.status = status
         job.error = reason
