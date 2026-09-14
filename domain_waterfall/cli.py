@@ -22,7 +22,8 @@ def main(argv: list[str] | None = None) -> int:
     res.add_argument("client_tag")
     res.add_argument("--max-tier", default="")
     res.add_argument("--min-tier", default="")
-    res.add_argument("--skip-tiers", default="", help="Comma-separated tiers to skip on the real run")
+    res.add_argument("--skip-tiers", default="", help="Comma separated tiers to skip on the real run")
+    res.add_argument("--concurrency", type=int, default=None, help="Override TIER_CONCURRENCY (cap 32)")
     res.add_argument("--approve-cost-usd", type=float, default=None)
     res.add_argument("--estimate-only", action="store_true")
     res.add_argument("--limit", type=int, default=None)
@@ -69,6 +70,7 @@ def main(argv: list[str] | None = None) -> int:
             max_tier=args.max_tier,
             min_tier=args.min_tier,
             skip_tiers=args.skip_tiers,
+            concurrency=args.concurrency,
             approve_cost_usd=args.approve_cost_usd,
             estimate_only=args.estimate_only,
             writeback=not args.no_writeback,

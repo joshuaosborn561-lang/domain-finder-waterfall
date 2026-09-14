@@ -57,3 +57,6 @@ class TierResult:
     error: str | None = None
     skipped: str | None = None
     rows_done: int = 0
+    errored: int = 0
+    # Explicit billing fields so free tiers do not look like uncounted spend.
+    billing: str = ""

@@ -17,7 +17,6 @@ JOBS_DIR = ROOT / "data" / "jobs"
 
 STALL_SECONDS = 300.0
 STALL_POLL_SECONDS = 15.0
-STALL_REASON = "stalled: no progress for 5 minutes"
 
 
 @dataclass
@@ -55,40 +54,58 @@ def is_cancelled(job_id: str) -> bool:
     return bool(ev and ev.is_set())
 
 
-def _parse_progress_ts(job: Job) -> float:
-    raw = (job.result or {}).get("last_progress_at")
-    if isinstance(raw, (int, float)) and raw > 0:
-        return float(raw)
-    if isinstance(raw, str) and raw.strip():
-        text = raw.strip().replace("Z", "+00:00")
-        try:
-            return datetime.fromisoformat(text).timestamp()
-        except ValueError:
-            pass
-    return float(job.started_at or job.created_at)
+def _terminal(status: str) -> bool:
+    return status in ("completed", "failed", "stalled", "cancelled")
 
 
-def request_cancel(job_id: str, reason: str) -> None:
+def _requests_made(job: Job) -> int:
+    res = job.result or {}
+    for key in ("requests_made",):
+        val = res.get(key)
+        if isinstance(val, (int, float)):
+            return int(val)
+    # Fall back to sum of finished tier request counters while a tier is in flight.
+    tiers = res.get("tiers") or []
+    total = 0
+    if isinstance(tiers, list):
+        for t in tiers:
+            if isinstance(t, dict) and isinstance(t.get("requests_made"), (int, float)):
+                total += int(t["requests_made"])
+    cur = res.get("requests_made")
+    if isinstance(cur, (int, float)):
+        return int(cur)
+    return total
+
+
+def request_cancel(job_id: str, reason: str, *, status: str = "cancelled") -> dict[str, Any]:
+    """Signal workers to stop. Flushes via should_stop; status sticks."""
     ev = _cancels.get(job_id)
     if ev:
         ev.set()
     with _lock:
         job = _jobs.get(job_id)
-        if job is None or job.status in ("completed", "failed"):
-            return
-        job.status = "failed"
+        if job is None:
+            return {"ok": False, "job_id": job_id, "status": "unknown", "error": "job not found"}
+        if _terminal(job.status) and job.status != "running":
+            return job.to_public() | {"ok": True, "job_id": job.id}
+        job.status = status
         job.error = reason
         snap = dict(job.result or {})
-        snap["status"] = "failed"
+        snap["status"] = status
         snap["error"] = reason
-        snap["progress"] = "failed"
+        snap["progress"] = status
+        tier = snap.get("tier") or ""
+        if status == "stalled" and tier and "tier" not in reason:
+            job.error = f"{reason}, tier {tier}"
+            snap["error"] = job.error
         job.result = snap
         job.finished_at = time.time()
     _persist(job)
+    return get_job(job_id)
 
 
 def get_job(job_id: str) -> dict[str, Any]:
-    """Never raise. Unknown ids return last-known-style progress with status=unknown."""
+    """Never raise. Unknown ids return last known style progress with status=unknown."""
     job_id = (job_id or "").strip()
     if not job_id:
         return {"ok": False, "status": "unknown", "error": "job_id is required", "result": {}}
@@ -137,22 +154,36 @@ def update_job_progress(job_id: str, snapshot: dict[str, Any]) -> None:
         return
     with _lock:
         job = _jobs.get(job_id)
-        if job is None or job.status == "failed":
+        if job is None or _terminal(job.status):
             return
         job.result = dict(snapshot)
     _persist(job)
 
 
 def _stall_watch(job_id: str, cancel: threading.Event) -> None:
+    last_seen_requests: int | None = None
+    last_move = time.time()
     while not cancel.wait(STALL_POLL_SECONDS):
         with _lock:
             job = _jobs.get(job_id)
         if job is None or job.status != "running":
             return
-        age = time.time() - _parse_progress_ts(job)
-        if age >= STALL_SECONDS:
-            request_cancel(job_id, STALL_REASON)
-            return
+        made = _requests_made(job)
+        if last_seen_requests is None or made != last_seen_requests:
+            last_seen_requests = made
+            last_move = time.time()
+            continue
+        # Also require that we are inside a tier that should be making requests.
+        phase = (job.result or {}).get("phase")
+        tier = (job.result or {}).get("tier") or ""
+        if phase == "tier" and tier in ("maps", "serp", "aiark", "discolike", "prospeo", "leadmagic"):
+            if time.time() - last_move >= STALL_SECONDS:
+                request_cancel(
+                    job_id,
+                    f"stalled, no requests_made progress for 5 minutes, tier {tier}",
+                    status="stalled",
+                )
+                return
 
 
 def start_job(
@@ -166,7 +197,7 @@ def start_job(
         status="queued",
         created_at=time.time(),
         meta=meta or {},
-        result={"progress": "queued"},
+        result={"progress": "queued", "requests_made": 0},
     )
     cancel = threading.Event()
     with _lock:
@@ -179,6 +210,7 @@ def start_job(
         job.started_at = time.time()
         job.result = {
             "progress": "running",
+            "requests_made": 0,
             "last_progress_at": datetime.now(timezone.utc)
             .replace(microsecond=0)
             .isoformat()
@@ -190,12 +222,21 @@ def start_job(
         ).start()
         try:
             result = fn(job) or {"progress": "completed"}
-            if cancel.is_set() or job.status == "failed":
+            if cancel.is_set() or _terminal(job.status):
+                # Keep stalled/cancelled status; merge partial result if richer.
+                if isinstance(result, dict) and result.get("tiers"):
+                    with _lock:
+                        merged = dict(job.result or {})
+                        merged.update(result)
+                        merged["status"] = job.status
+                        if job.error:
+                            merged["error"] = job.error
+                        job.result = merged
                 return
             job.result = result
             job.status = "completed"
         except Exception as exc:  # noqa: BLE001
-            if cancel.is_set() or job.status == "failed":
+            if cancel.is_set() or _terminal(job.status):
                 return
             job.status = "failed"
             job.error = f"{type(exc).__name__}: {exc}"

@@ -16,6 +16,28 @@ from typing import Any, Callable, Iterator, TypeVar
 
 import requests
 
+
+class VendorThrottle(Exception):
+    """Vendor returned 429 or equivalent. Not a miss, not credit exhaustion."""
+
+    def __init__(self, tier: str, detail: str = "") -> None:
+        msg = f"vendor throttle: {tier}"
+        if detail:
+            msg = f"{msg}, {detail}"
+        super().__init__(msg)
+        self.tier = tier
+
+
+class VendorTransportError(Exception):
+    """Transport or server failure. Retryable. Must not become a miss."""
+
+    def __init__(self, tier: str, detail: str = "") -> None:
+        msg = f"vendor transport error: {tier}"
+        if detail:
+            msg = f"{msg}, {detail}"
+        super().__init__(msg)
+        self.tier = tier
+
 TIER_ENV_KEYS: dict[str, str] = {
     "maps": "MAPS_CONCURRENCY",
     "aiark": "AIARK_CONCURRENCY",
@@ -26,10 +48,11 @@ TIER_ENV_KEYS: dict[str, str] = {
 }
 
 DEFAULT_VENDOR_LIMITS: dict[str, int] = {
-    "maps": 4,
+    # Maps HTTP slots must cover TIER_CONCURRENCY (default 12), else the pool stalls on the gate.
+    "maps": 16,
     "aiark": 8,
     "discolike": 2,
-    "serp": 2,
+    "serp": 8,
     "prospeo": 6,
     "leadmagic": 4,
     "cache": 20,
@@ -192,14 +215,20 @@ def request_with_retry(
                 time.sleep(_retry_delay(attempt, None))
                 continue
             raise VendorCallTimeout(tier, str(exc)) from exc
-        except requests.RequestException:
+        except requests.RequestException as exc:
             if attempt < max_attempts - 1:
                 time.sleep(_retry_delay(attempt, None))
                 continue
-            return None
-        if last is not None and (last.status_code == 429 or last.status_code >= 500):
+            raise VendorTransportError(tier, str(exc)) from exc
+        if last is not None and last.status_code == 429:
             if attempt < max_attempts - 1:
                 time.sleep(_retry_delay(attempt, last))
                 continue
+            raise VendorThrottle(tier, "http 429")
+        if last is not None and last.status_code >= 500:
+            if attempt < max_attempts - 1:
+                time.sleep(_retry_delay(attempt, last))
+                continue
+            raise VendorTransportError(tier, f"http {last.status_code}")
         return last
     return last

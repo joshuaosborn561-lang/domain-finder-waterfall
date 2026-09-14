@@ -74,7 +74,10 @@ def test_semaphore_released_during_backoff(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(requests, "request", fake_request)
 
     def worker() -> None:
-        request_with_retry("maps", "GET", "http://example.invalid", max_attempts=2, timeout=1)
+        try:
+            request_with_retry("maps", "GET", "http://example.invalid", max_attempts=2, timeout=1)
+        except concurrency.VendorThrottle:
+            pass
 
     t = threading.Thread(target=worker)
     t.start()
@@ -102,4 +105,24 @@ def test_hanging_http_hits_hard_timeout(monkeypatch: pytest.MonkeyPatch) -> None
             acquire_timeout=1,
         )
     assert time.monotonic() - t0 < 3.0
+    vendor_gate.reset()
+
+
+def test_429_raises_throttle_not_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_request(*_a: object, **_k: object) -> MagicMock:
+        resp = MagicMock()
+        resp.status_code = 429
+        resp.headers = {}
+        return resp
+
+    monkeypatch.setattr(requests, "request", fake_request)
+    with pytest.raises(concurrency.VendorThrottle):
+        request_with_retry(
+            "maps",
+            "GET",
+            "http://example.invalid",
+            max_attempts=1,
+            timeout=1,
+            acquire_timeout=1,
+        )
     vendor_gate.reset()

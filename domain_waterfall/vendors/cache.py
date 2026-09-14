@@ -75,7 +75,13 @@ def lookup_many(
     by_norm: dict[str, DomainCandidate] = {}
     for raw_name, cand in keyed.candidates.items():
         by_norm[normalize_name(raw_name)] = cand
-    out = TierResult(tier="cache", inputs_passed=["company_name_normalized"])
+    out = TierResult(
+        tier="cache",
+        inputs_passed=["company_name_normalized"],
+        cost_usd=0.0,
+        credits=0.0,
+        billing="free, local cache, unit_usd 0",
+    )
     for row in rows:
         key = str(row.get("_source_key"))
         norm = normalize_name(str(row.get("company_name") or ""))
