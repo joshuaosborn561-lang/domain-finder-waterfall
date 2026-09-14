@@ -24,3 +24,5 @@ def test_row_ticker_emits_first_last_and_throttles() -> None:
     assert [s["processed"] for s in seen] == [1, 5, 10]
     assert seen[-1]["hits"] == 3
     assert seen[-1]["targets"] == 10
+    assert seen[-1]["rows_attempted"] == 10
+    assert "last_progress_at" in seen[-1]

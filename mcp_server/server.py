@@ -189,14 +189,20 @@ def resolve_domain(
     where: str,
     client_tag: str,
     max_tier: str = "",
+    min_tier: str = "",
+    skip_tiers: str = "",
     approve_cost_usd: float | None = None,
     estimate_only: bool = False,
     limit: int | None = None,
+    concurrency: int | None = None,
 ) -> str:
     """Resolve domains onto source rows. source_table + where only. Counts/cost, no rows.
 
     estimate_only=true returns rows per tier, live unit prices, and a dollar total.
-    approve_cost_usd is the paid-tier ceiling; free tiers ignore it.
+    approve_cost_usd is the paid tier ceiling; free tiers ignore it.
+    min_tier / skip_tiers apply to the real run only (not estimate_only).
+    skip_tiers is a comma separated list (e.g. "maps").
+    concurrency overrides TIER_CONCURRENCY for maps/serp (cap 32).
     """
     _ensure_repo_cwd()
     _reload_settings()
@@ -207,26 +213,43 @@ def resolve_domain(
     if not (client_tag or "").strip():
         raise ValueError("client_tag is required")
 
-    def _run_resolve(progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
+    conc: int | None = None
+    if concurrency is not None and concurrency != "":
+        try:
+            conc = int(concurrency)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("concurrency must be an integer") from exc
+
+    def _run_resolve(
+        progress: Callable[[dict[str, Any]], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         return _resolve(
             source_table=source_table,
             where=where or "",
             client_tag=client_tag,
             max_tier=max_tier or "",
+            min_tier=min_tier or "",
+            skip_tiers=skip_tiers,
             approve_cost_usd=approve_cost_usd,
             estimate_only=bool(estimate_only),
             progress=progress,
             writeback=not estimate_only,
             limit=int(limit) if limit else None,
+            should_stop=should_stop,
+            concurrency=conc,
         )
 
     if estimate_only:
         return _json(_run_resolve())
 
     def _job(job: Any) -> dict[str, Any]:
-        from mcp_server.jobs import update_job_progress
+        from mcp_server.jobs import is_cancelled, update_job_progress
 
-        return _run_resolve(lambda snap: update_job_progress(job.id, snap))
+        return _run_resolve(
+            progress=lambda snap: update_job_progress(job.id, snap),
+            should_stop=lambda: is_cancelled(job.id),
+        )
 
     if _http_mode():
         from mcp_server.jobs import start_job
@@ -239,7 +262,10 @@ def resolve_domain(
                 "source_table": source_table,
                 "where": where,
                 "max_tier": max_tier,
+                "min_tier": min_tier,
+                "skip_tiers": skip_tiers,
                 "limit": limit,
+                "concurrency": conc,
             },
         )
         return _json(
@@ -260,10 +286,27 @@ def resolve_domain(
     )
 )
 def get_job_status(job_id: str) -> str:
-    """Last known progress on a long job. Includes processed/targets/hits mid-tier. Never a bare error."""
+    """Last known progress on a long job. Includes processed/targets/hits mid tier. Never a bare error."""
     from mcp_server.jobs import get_job
 
     return _json(get_job(job_id))
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Cancel a running job",
+        readOnlyHint=False,
+        openWorldHint=False,
+        destructiveHint=True,
+    )
+)
+def cancel_job(job_id: str) -> str:
+    """Stop a running job. Drains the worker pool and flushes partial results. Target under 30 seconds."""
+    from mcp_server.jobs import request_cancel
+
+    if not (job_id or "").strip():
+        raise ValueError("job_id is required")
+    return _json(request_cancel(job_id.strip(), "cancelled by caller", status="cancelled"))
 
 
 @mcp.tool(

@@ -10,6 +10,7 @@ def test_tool_names() -> None:
         tools = asyncio.run(tools)
     names = sorted(t.name for t in tools)
     assert names == [
+        "cancel_job",
         "ensure_profile",
         "get_job_status",
         "get_profile",
@@ -31,6 +32,10 @@ def test_resolve_has_no_inline_rows() -> None:
     assert "rows" not in params
     assert "estimate_only" in params
     assert "approve_cost_usd" in params
+    assert "min_tier" in params
+    assert "skip_tiers" in params
+    assert "concurrency" in params
+    assert "limit" in params
 
 
 def test_get_job_status_never_raises() -> None:
