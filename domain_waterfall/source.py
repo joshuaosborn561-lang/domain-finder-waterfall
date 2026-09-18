@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -10,6 +10,8 @@ from typing import Any
 from . import supabase as sb
 from .config import DEFAULT_SUPABASE_PROJECT
 from .normalize import normalize_name
+
+log = logging.getLogger("domain_waterfall.source")
 
 PAGE_SIZE = 500
 INPUT_FIELDS = (
@@ -33,6 +35,17 @@ FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "street": ("street", "address", "street_address"),
     "country": ("country",),
     "domain": ("domain", "website"),
+}
+# id first for tables that already have it. place_id covers Maps-sourced queues.
+KEY_CANDIDATES = ("id", "place_id", "pk", "row_id", "uuid")
+PROFILE_COLUMN_KEYS: dict[str, tuple[str, ...]] = {
+    "company_name": ("name_column", "company_name_column"),
+    "city": ("city_column",),
+    "state": ("state_column",),
+    "domain": ("domain_column",),
+    "phone": ("phone_column",),
+    "zip": ("zip_column",),
+    "street": ("street_column", "address_column"),
 }
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -63,6 +76,8 @@ class TableSource:
     where: str = ""
     key_column: str = "id"
     column_map: dict[str, str] = field(default_factory=dict)
+    column_overrides: dict[str, str] = field(default_factory=dict)
+    available_columns: set[str] = field(default_factory=set)
     limit: int | None = None
     map_explicit: bool = False
 
@@ -149,33 +164,116 @@ def where_to_filters(where: str) -> list[dict[str, Any]]:
     return out
 
 
+def _coerce_columns(data: Any) -> set[str]:
+    if isinstance(data, dict):
+        data = (
+            data.get("dw_source_columns")
+            or data.get("columns")
+            or data.get("cols")
+            or data
+        )
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        nested = data[0].get("dw_source_columns") or data[0].get("columns") or data[0].get("cols")
+        if nested is not None:
+            data = nested
+    if isinstance(data, str):
+        text = data.strip()
+        if text.startswith("{") and text.endswith("}"):
+            text = text[1:-1]
+        data = [p.strip().strip('"') for p in text.split(",") if p.strip()]
+    if isinstance(data, list):
+        return {str(c) for c in data if c and not isinstance(c, dict)}
+    return set()
+
+
 def list_columns(src: TableSource) -> set[str]:
     data = sb.rpc("dw_source_columns", {"p_schema": src.schema, "p_table": src.table})
-    if isinstance(data, dict):
-        data = data.get("dw_source_columns") or data.get("columns") or data
-    if isinstance(data, list) and data and isinstance(data[0], dict):
-        data = data[0].get("dw_source_columns") or data
-    if isinstance(data, list):
-        return {str(c) for c in data if c}
-    return set()
+    return _coerce_columns(data)
+
+
+def profile_column_overrides(raw: dict[str, Any] | None) -> dict[str, str]:
+    blob = raw if isinstance(raw, dict) else {}
+    out: dict[str, str] = {}
+    for field_name, keys in PROFILE_COLUMN_KEYS.items():
+        for key in keys:
+            val = blob.get(key)
+            if val and _IDENT.match(str(val).strip()):
+                out[field_name] = str(val).strip()
+                break
+    return out
+
+
+def apply_column_overrides(src: TableSource, raw: dict[str, Any] | None) -> None:
+    """Record profile column names. discover_column_map applies them after listing cols."""
+    src.column_overrides = profile_column_overrides(raw)
+    blob = raw if isinstance(raw, dict) else {}
+    key = blob.get("key_column") or blob.get("id_column")
+    if key and _IDENT.match(str(key).strip()):
+        src.key_column = str(key).strip()
 
 
 def discover_column_map(src: TableSource) -> None:
     cols = list_columns(src)
     if not cols:
-        return
+        raise ValueError(f"no columns found for {src.qualified}")
+    src.available_columns = set(cols)
     mapping: dict[str, str] = {}
     for field_name, candidates in FIELD_CANDIDATES.items():
         for cand in candidates:
             if cand in cols:
                 mapping[field_name] = cand
                 break
+    for field_name, col in src.column_overrides.items():
+        if col not in cols:
+            raise ValueError(
+                f"profile {field_name} column {col!r} is not on {src.qualified}, "
+                f"columns={sorted(cols)}"
+            )
+        mapping[field_name] = col
     src.column_map = mapping
     if src.key_column not in cols:
-        for cand in ("id", "pk", "row_id", "company_name", "contractor_name"):
-            if cand in cols:
-                src.key_column = cand
-                break
+        picked = next((c for c in KEY_CANDIDATES if c in cols), "")
+        if not picked:
+            raise ValueError(
+                f"{src.qualified} has no usable key column "
+                f"(looked for {', '.join(KEY_CANDIDATES)}), "
+                f"columns={sorted(cols)}"
+            )
+        src.key_column = picked
+
+
+def describe_filter_sql(where: str) -> str:
+    parts = ["true"]
+    for filt in where_to_filters(where):
+        col = filt["col"]
+        op = filt["op"]
+        if op == "is null":
+            parts.append(f"{col} IS NULL")
+        elif op == "is not null":
+            parts.append(f"{col} IS NOT NULL")
+        elif op == "eq":
+            parts.append(f"{col} = {filt['value']!r}")
+        elif op == "neq":
+            parts.append(f"{col} <> {filt['value']!r}")
+        elif op == "in":
+            items = ", ".join(repr(x) for x in filt.get("value") or [])
+            parts.append(f"{col} IN ({items})")
+        else:
+            parts.append(f"{col} {op}")
+    return " WHERE " + " AND ".join(parts)
+
+
+def describe_count_sql(src: TableSource) -> str:
+    return f"SELECT count(*) FROM {src.schema}.{src.table}{describe_filter_sql(src.where)}"
+
+
+def describe_read_sql(src: TableSource) -> str:
+    cols = _select_list(src)
+    select = ", ".join(cols) if cols else src.key_column
+    return (
+        f"SELECT {select} FROM {src.schema}.{src.table}"
+        f"{describe_filter_sql(src.where)} ORDER BY {src.key_column}"
+    )
 
 
 def _select_list(src: TableSource) -> list[str]:

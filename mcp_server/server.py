@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
+
+try:
+    from mcp.server.mcpserver.exceptions import ToolError
+except ImportError:  # pragma: no cover
+    ToolError = None  # type: ignore[misc, assignment]
 
 from mcp_server.playbook import INSTRUCTIONS, WHEN_TO_USE
 
@@ -28,6 +35,26 @@ mcp = MCPServer(
 
 def _json(data: Any) -> str:
     return json.dumps(data, indent=2, default=str)
+
+
+def _configure_logging() -> None:
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+            stream=sys.stdout,
+        )
+    logging.getLogger("domain_waterfall").setLevel(logging.INFO)
+
+
+def _raise_tool_error(exc: BaseException) -> None:
+    """Surface the real exception. FastMCP strips unexpected crashes to a bare name."""
+    detail = f"{type(exc).__name__}: {exc}"
+    logging.getLogger("domain_waterfall").exception("resolve_domain failed, %s", detail)
+    if ToolError is not None:
+        raise ToolError(detail) from exc
+    raise RuntimeError(detail) from exc
 
 
 def _ensure_repo_cwd() -> None:
@@ -205,77 +232,82 @@ def resolve_domain(
     concurrency overrides TIER_CONCURRENCY for maps/serp (cap 32).
     """
     _ensure_repo_cwd()
+    _configure_logging()
     _reload_settings()
     from domain_waterfall.waterfall import resolve_domain as _resolve
 
-    if not (source_table or "").strip():
-        raise ValueError("source_table is required")
-    if not (client_tag or "").strip():
-        raise ValueError("client_tag is required")
+    try:
+        if not (source_table or "").strip():
+            raise ValueError("source_table is required")
+        if not (client_tag or "").strip():
+            raise ValueError("client_tag is required")
 
-    conc: int | None = None
-    if concurrency is not None and concurrency != "":
-        try:
-            conc = int(concurrency)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("concurrency must be an integer") from exc
+        conc: int | None = None
+        if concurrency is not None and concurrency != "":
+            try:
+                conc = int(concurrency)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("concurrency must be an integer") from exc
 
-    def _run_resolve(
-        progress: Callable[[dict[str, Any]], None] | None = None,
-        should_stop: Callable[[], bool] | None = None,
-    ) -> dict[str, Any]:
-        return _resolve(
-            source_table=source_table,
-            where=where or "",
-            client_tag=client_tag,
-            max_tier=max_tier or "",
-            min_tier=min_tier or "",
-            skip_tiers=skip_tiers,
-            approve_cost_usd=approve_cost_usd,
-            estimate_only=bool(estimate_only),
-            progress=progress,
-            writeback=not estimate_only,
-            limit=int(limit) if limit else None,
-            should_stop=should_stop,
-            concurrency=conc,
-        )
+        def _run_resolve(
+            progress: Callable[[dict[str, Any]], None] | None = None,
+            should_stop: Callable[[], bool] | None = None,
+        ) -> dict[str, Any]:
+            return _resolve(
+                source_table=source_table,
+                where=where or "",
+                client_tag=client_tag,
+                max_tier=max_tier or "",
+                min_tier=min_tier or "",
+                skip_tiers=skip_tiers,
+                approve_cost_usd=approve_cost_usd,
+                estimate_only=bool(estimate_only),
+                progress=progress,
+                writeback=not estimate_only,
+                limit=int(limit) if limit else None,
+                should_stop=should_stop,
+                concurrency=conc,
+            )
 
-    if estimate_only:
+        if estimate_only:
+            return _json(_run_resolve())
+
+        def _job(job: Any) -> dict[str, Any]:
+            from mcp_server.jobs import is_cancelled, update_job_progress
+
+            return _run_resolve(
+                progress=lambda snap: update_job_progress(job.id, snap),
+                should_stop=lambda: is_cancelled(job.id),
+            )
+
+        if _http_mode():
+            from mcp_server.jobs import start_job
+
+            job = start_job(
+                "resolve_domain",
+                _job,
+                meta={
+                    "client_tag": client_tag,
+                    "source_table": source_table,
+                    "where": where,
+                    "max_tier": max_tier,
+                    "min_tier": min_tier,
+                    "skip_tiers": skip_tiers,
+                    "limit": limit,
+                    "concurrency": conc,
+                },
+            )
+            return _json(
+                {
+                    "job_id": job.id,
+                    "status": job.status,
+                    "message": f"Poll get_job_status with job_id={job.id}.",
+                }
+            )
         return _json(_run_resolve())
-
-    def _job(job: Any) -> dict[str, Any]:
-        from mcp_server.jobs import is_cancelled, update_job_progress
-
-        return _run_resolve(
-            progress=lambda snap: update_job_progress(job.id, snap),
-            should_stop=lambda: is_cancelled(job.id),
-        )
-
-    if _http_mode():
-        from mcp_server.jobs import start_job
-
-        job = start_job(
-            "resolve_domain",
-            _job,
-            meta={
-                "client_tag": client_tag,
-                "source_table": source_table,
-                "where": where,
-                "max_tier": max_tier,
-                "min_tier": min_tier,
-                "skip_tiers": skip_tiers,
-                "limit": limit,
-                "concurrency": conc,
-            },
-        )
-        return _json(
-            {
-                "job_id": job.id,
-                "status": job.status,
-                "message": f"Poll get_job_status with job_id={job.id}.",
-            }
-        )
-    return _json(_run_resolve())
+    except Exception as exc:
+        _raise_tool_error(exc)
+        raise
 
 
 @mcp.tool(
@@ -357,6 +389,7 @@ _mount_http_routes()
 
 def main() -> None:
     _ensure_repo_cwd()
+    _configure_logging()
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
