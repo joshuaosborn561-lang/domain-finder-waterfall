@@ -1,3 +1,7 @@
+import pytest
+
+from mcp.server.mcpserver.exceptions import ToolError
+
 from mcp_server.server import get_job_status, mcp, resolve_domain
 
 
@@ -43,3 +47,25 @@ def test_get_job_status_never_raises() -> None:
     assert "unknown" in payload or "job_id is required" in payload
     payload = get_job_status("does-not-exist")
     assert "status" in payload
+
+
+def test_resolve_domain_surfaces_exception() -> None:
+    with pytest.raises(ToolError, match="source_table is required") as excinfo:
+        resolve_domain(source_table="", where="domain is null", client_tag="emcor", estimate_only=True)
+    assert "Error executing tool" not in str(excinfo.value) or "source_table is required" in str(excinfo.value)
+    assert "source_table is required" in str(excinfo.value)
+
+
+def test_resolve_domain_surfaces_runtime_detail(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(**_kwargs):
+        raise RuntimeError('column "id" does not exist')
+
+    monkeypatch.setattr("domain_waterfall.waterfall.resolve_domain", boom)
+    with pytest.raises(ToolError, match='column "id" does not exist') as excinfo:
+        resolve_domain(
+            source_table="emcor_needs_domain",
+            where="domain is null",
+            client_tag="emcor",
+            estimate_only=True,
+        )
+    assert "RuntimeError" in str(excinfo.value)

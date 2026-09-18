@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -13,13 +14,18 @@ from .normalize import extract_domain, normalize_name
 from .pricing import DEFAULT_PIPELINE, compute_order, estimate_rows
 from .profiles import ClientProfile, get_profile
 from .source import (
-    TableSource,
+    apply_column_overrides,
+    count_source_rows,
     defer_unfetched,
+    describe_count_sql,
+    describe_read_sql,
     ensure_writeback,
     fetch_source_rows,
     parse_source,
     patch_source_row,
 )
+
+log = logging.getLogger("domain_waterfall")
 from .tier_pool import WRITEBACK_CHUNK, chunked, resolve_tier_concurrency
 from .vendors import aiark, cache, discolike, leadmagic, maps, prospeo, serp
 from .vendors.base import DomainCandidate, OnProgress, TierResult
@@ -298,6 +304,7 @@ def resolve_domain(
     hydrate_keys()
     profile = get_profile(client_tag)
     src = parse_source(source_table, where, limit=limit)
+    apply_column_overrides(src, profile.raw)
     units, price_meta = live_prices()
     order = compute_order(
         profile.enabled_tiers,
@@ -311,23 +318,76 @@ def resolve_domain(
         if stop in order.tiers:
             order.tiers = order.tiers[: order.tiers.index(stop) + 1]
 
+    def _attach_estimate(n_rows: int, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = estimate_rows(n_rows, order)
+        payload["live_units"] = {k: order.prices[k].unit for k in order.tiers}
+        payload["price_meta"] = {
+            k: {kk: vv for kk, vv in (price_meta.get(k) or {}).items() if kk != "account"}
+            for k in price_meta
+        }
+        payload["tier_order"] = order.as_profile()
+        payload["client_tag"] = profile.client_tag
+        payload["source_table"] = src.qualified
+        payload["where"] = src.where
+        payload["key_column"] = src.key_column
+        payload["column_map"] = dict(src.column_map)
+        payload["source_sql"] = describe_count_sql(src)
+        if extra:
+            payload.update(extra)
+        return payload
+
+    if estimate_only:
+        count_sql = describe_count_sql(src)
+        plan = order.as_profile()
+        log.info(
+            "estimate_only client_tag=%s source=%s where=%s sql=%s "
+            "key_column=%s column_overrides=%s tier_plan=%s",
+            profile.client_tag,
+            src.qualified,
+            src.where,
+            count_sql,
+            src.key_column,
+            src.column_overrides,
+            plan,
+        )
+        matched = count_source_rows(src)
+        n = min(matched, src.limit) if src.limit is not None else matched
+        log.info(
+            "estimate_only resolved sql=%s key_column=%s column_map=%s "
+            "rows_matched=%s rows=%s tier_plan=%s",
+            describe_count_sql(src),
+            src.key_column,
+            src.column_map,
+            matched,
+            n,
+            plan,
+        )
+        estimate = _attach_estimate(
+            n,
+            {
+                "rows_matched": matched,
+                "rows_fetched": 0,
+                "rows_excluded": max(0, matched - n),
+                "exclusion_reasons": (
+                    {"job_limit": matched - n} if src.limit is not None and matched > n else {}
+                ),
+            },
+        )
+        return {"ok": True, "estimate_only": True, **estimate}
+
     fetched = fetch_source_rows(src)
     census = fetched.to_public()
     rows = fetched.rows
     n = len(rows)
-    estimate = estimate_rows(n, order)
-    estimate["live_units"] = {k: order.prices[k].unit for k in order.tiers}
-    estimate["price_meta"] = {
-        k: {kk: vv for kk, vv in (price_meta.get(k) or {}).items() if kk != "account"}
-        for k in price_meta
-    }
-    estimate["tier_order"] = order.as_profile()
-    estimate["client_tag"] = profile.client_tag
-    estimate["source_table"] = src.qualified
-    estimate["where"] = src.where
-    estimate.update(census)
-    if estimate_only:
-        return {"ok": True, "estimate_only": True, **estimate}
+    estimate = _attach_estimate(n, census)
+    log.info(
+        "resolve_domain source=%s sql=%s key_column=%s rows_matched=%s rows_fetched=%s",
+        src.qualified,
+        describe_read_sql(src),
+        src.key_column,
+        census.get("rows_matched"),
+        n,
+    )
 
     # min_tier / skip_tiers apply to the real run only. Estimate stays complete.
     order.tiers = apply_tier_filters(

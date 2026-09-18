@@ -69,6 +69,7 @@ def _stub_resolve(monkeypatch: pytest.MonkeyPatch, ran: list[str]) -> None:
         exclusion_reasons={},
     )
     monkeypatch.setattr(wf, "fetch_source_rows", lambda _src: fetched)
+    monkeypatch.setattr(wf, "count_source_rows", lambda _src: fetched.rows_matched)
     monkeypatch.setattr(wf, "ensure_writeback", lambda _src: None)
     monkeypatch.setattr(wf, "patch_source_row", lambda *_a, **_k: None)
     monkeypatch.setattr(wf, "defer_unfetched", lambda *_a, **_k: 0)
@@ -126,6 +127,29 @@ def test_min_tier_on_real_run(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     assert ran == ["aiark"]
     assert out["ok"] is True
+
+
+def test_estimate_only_logs_sql_and_tier_plan(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    ran: list[str] = []
+    _stub_resolve(monkeypatch, ran)
+    caplog.set_level(logging.INFO, logger="domain_waterfall")
+    out = resolve_domain(
+        source_table="public.t",
+        where="domain is null",
+        client_tag="t",
+        estimate_only=True,
+        max_tier="aiark",
+    )
+    assert out["estimate_only"] is True
+    assert out["source_sql"] == "SELECT count(*) FROM public.t WHERE true AND domain IS NULL"
+    assert "tier_plan" in caplog.text or "cache" in caplog.text
+    assert "SELECT count(*) FROM public.t" in caplog.text
+    assert out["rows_matched"] == 1
+    assert ran == []
 
 
 def test_estimate_only_ignores_skip_and_min(monkeypatch: pytest.MonkeyPatch) -> None:
