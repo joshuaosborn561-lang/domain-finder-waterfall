@@ -6,6 +6,7 @@ Progress counters are updated under a lock so the stall detector stays honest.
 
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import random
@@ -16,6 +17,8 @@ from typing import Any, Callable
 
 from domain_waterfall.concurrency import VendorThrottle, VendorTransportError
 from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
+
+log = logging.getLogger("domain_waterfall.tier_pool")
 
 TIER_CONCURRENCY_CAP = 32
 # Slice bench: concurrency 12 drops vendor hit rate about 5pp vs serial on this
@@ -248,6 +251,13 @@ def run_row_pool(
                     continue
                 except (VendorTransportError, TimeoutError, OSError) as exc:
                     last_err = exc
+                    log.warning(
+                        "tier %s row %s attempt %s failed, %s",
+                        tier,
+                        key,
+                        attempt + 1,
+                        exc,
+                    )
                     requests_total += 1
                     tracker.bump(requests=1)
                     emit_progress(tracker.snapshot())
@@ -297,7 +307,9 @@ def run_row_pool(
             out.rows_done += 1
             out.calls += max(1, requests_total)
             if last_err and not out.error:
-                out.error = f"row errors after retries, e.g. {type(last_err).__name__}"
+                out.error = f"row errors after retries, {last_err}"
+            if last_err:
+                log.error("tier %s row %s retries exhausted, %s", tier, key, last_err)
         extra = tracker.bump(
             processed=1,
             rows_done=1,

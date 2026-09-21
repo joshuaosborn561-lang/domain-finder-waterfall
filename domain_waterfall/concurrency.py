@@ -7,6 +7,7 @@ cannot pin a tier forever — requests' own timeout does not cover getaddrinfo.
 
 from __future__ import annotations
 
+import logging
 import os
 import random
 import threading
@@ -15,6 +16,8 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterator, TypeVar
 
 import requests
+
+log = logging.getLogger("domain_waterfall.concurrency")
 
 
 class VendorThrottle(Exception):
@@ -31,12 +34,33 @@ class VendorThrottle(Exception):
 class VendorTransportError(Exception):
     """Transport or server failure. Retryable. Must not become a miss."""
 
-    def __init__(self, tier: str, detail: str = "") -> None:
-        msg = f"vendor transport error: {tier}"
-        if detail:
-            msg = f"{msg}, {detail}"
-        super().__init__(msg)
+    def __init__(
+        self,
+        tier: str,
+        detail: str = "",
+        *,
+        status: int | str | None = None,
+        message: str = "",
+        timeout: float | None = None,
+        url: str = "",
+    ) -> None:
+        bits = [f"vendor transport error: {tier}"]
+        if status is not None and status != "":
+            bits.append(f"status={status}")
+        if timeout is not None:
+            bits.append(f"timeout={timeout:g}s")
+        text = message or detail
+        if text:
+            bits.append(text)
+        if url:
+            bits.append(f"url={url}")
+        super().__init__(", ".join(bits))
         self.tier = tier
+        self.status = status
+        self.message = text
+        self.timeout = timeout
+        self.url = url
+        log.warning("%s", self)
 
 TIER_ENV_KEYS: dict[str, str] = {
     "maps": "MAPS_CONCURRENCY",
@@ -219,7 +243,9 @@ def request_with_retry(
             if attempt < max_attempts - 1:
                 time.sleep(_retry_delay(attempt, None))
                 continue
-            raise VendorTransportError(tier, str(exc)) from exc
+            raise VendorTransportError(
+                tier, message=str(exc), timeout=hard_s, url=str(url)
+            ) from exc
         if last is not None and last.status_code == 429:
             if attempt < max_attempts - 1:
                 time.sleep(_retry_delay(attempt, last))
@@ -229,6 +255,11 @@ def request_with_retry(
             if attempt < max_attempts - 1:
                 time.sleep(_retry_delay(attempt, last))
                 continue
-            raise VendorTransportError(tier, f"http {last.status_code}")
+            raise VendorTransportError(
+                tier,
+                status=last.status_code,
+                message=f"http {last.status_code}",
+                url=str(url),
+            )
         return last
     return last
