@@ -6,8 +6,16 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from .normalize import area_code, distinctive_tokens, extract_domain, normalize_state, tld_of
+from .normalize import (
+    area_code,
+    distinctive_tokens,
+    domain_name_part,
+    extract_domain,
+    normalize_state,
+    tld_of,
+)
 
+# Exact labels plus prefix patterns ending in *. Applied before scoring.
 GLOBAL_BLOCKLIST = frozenset(
     {
         "yelp",
@@ -16,11 +24,19 @@ GLOBAL_BLOCKLIST = frozenset(
         "houzz",
         "facebook",
         "linkedin",
+        "instagram",
+        "twitter",
+        "tiktok",
+        "youtube",
         "indeed",
         "zoominfo",
         "manta",
         "mapquest",
+        "waze",
         "yellowpages",
+        "superpages",
+        "whitepages",
+        "cybo",
         "angi",
         "homeadvisor",
         "thumbtack",
@@ -34,6 +50,26 @@ GLOBAL_BLOCKLIST = frozenset(
         "google",
         "apple",
         "wikipedia",
+        "chamberofcommerce",
+        "localbiznetwork",
+        "seniorcare*",
+        "caring",
+        "aplaceformom",
+        "healthgrades",
+        "zocdoc",
+        "niche",
+        "greatschools",
+        "charitywater",
+        "charitynavigator",
+        "eacsociety",
+        "gofundme",
+        "justgiving",
+        "tripadvisor",
+        "nextdoor",
+        "hotfrog",
+        "citysearch",
+        "foursquare",
+        "machinist",
     }
 )
 
@@ -82,15 +118,36 @@ def _blob(*parts: str) -> str:
     return " ".join(p for p in parts if p)
 
 
+def _block_patterns(blocklist: Iterable[str]) -> tuple[set[str], list[str]]:
+    exact: set[str] = set()
+    prefixes: list[str] = []
+    for raw in blocklist:
+        item = str(raw or "").strip().lower().lstrip(".")
+        if not item:
+            continue
+        if item.endswith("*"):
+            prefixes.append(item[:-1])
+        else:
+            exact.add(item)
+    return exact, prefixes
+
+
+def _matches_block(label: str, exact: set[str], prefixes: list[str]) -> bool:
+    if label in exact:
+        return True
+    return any(label.startswith(p) for p in prefixes if p)
+
+
 def is_blocklisted(domain: str, blocklist: Iterable[str]) -> bool:
     host = extract_domain(domain)
     if not host:
         return True
     if host.endswith(".gov") or host.endswith(".gov.uk"):
         return True
-    labels = host.split(".")
-    blocked = {b.lower() for b in blocklist}
-    return any(label in blocked for label in labels)
+    exact, prefixes = _block_patterns(blocklist)
+    if any(_matches_block(label, exact, prefixes) for label in host.split(".") if label):
+        return True
+    return _matches_block(domain_name_part(host), exact, prefixes)
 
 
 def evaluate(
@@ -115,10 +172,12 @@ def evaluate(
         return GateResult(False, domain=host, reason="tld")
 
     tokens = distinctive_tokens(input_name, profile.name_strip_tokens)
-    hay = _blob(host, title, vendor_name).lower()
-    token_hit = any(tok in hay for tok in tokens) if tokens else True
+    name_part = domain_name_part(host)
+    # Title/snippet must not count. SERP titles include the company on directory pages.
+    token_on_domain = any(tok in name_part for tok in tokens) if tokens else False
     token_on_vendor = any(tok in (vendor_name or "").lower() for tok in tokens) if tokens else False
-    if tokens and not token_hit:
+    token_hit = token_on_domain
+    if tokens and not token_on_domain:
         return GateResult(False, domain=host, reason="token")
 
     industry_text = _blob(host, vendor_name, title)
@@ -155,8 +214,15 @@ def evaluate(
         # "If neither signal came back, cap at 0.7."
         geo_ok = False
 
-    if token_on_vendor and geo_ok:
+    if token_on_domain and (token_on_vendor or geo_ok):
         confidence = 0.9
+        status = "resolved"
+    elif token_on_vendor and geo_ok:
+        confidence = 0.9
+        status = "resolved"
+    elif token_on_domain:
+        # Domain tokens match the company name: score up from the old 0.5 title-only path.
+        confidence = 0.7
         status = "resolved"
     elif token_on_vendor or geo_ok:
         confidence = 0.7

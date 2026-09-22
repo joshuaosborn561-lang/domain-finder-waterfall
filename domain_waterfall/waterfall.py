@@ -246,7 +246,7 @@ def _run_tier(
     if name == "serp":
         return serp.resolve_rows(
             rows,
-            with_location=with_location,
+            with_location=True,
             unit=units.get("serp", 0.0045),
             on_progress=on_progress,
             deadline=deadline,

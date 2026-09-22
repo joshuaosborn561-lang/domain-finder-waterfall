@@ -27,6 +27,19 @@ def distinctive_tokens(name: str, tokens: list[str]) -> list[str]:
     return [w for w in stripped.split() if len(w) >= 3]
 
 
+def domain_name_part(domain: str) -> str:
+    """Registrable label without TLD, e.g. seniorcareauthority.com → seniorcareauthority."""
+    host = registrable(domain) or extract_domain(domain)
+    if "." in host:
+        return host.rsplit(".", 1)[0]
+    return host
+
+
+def domain_tokens(domain: str) -> list[str]:
+    part = domain_name_part(domain)
+    return [w for w in _PUNCT.split(part) if len(w) >= 3]
+
+
 def extract_domain(value: str) -> str:
     raw = (value or "").strip().lower()
     if not raw:

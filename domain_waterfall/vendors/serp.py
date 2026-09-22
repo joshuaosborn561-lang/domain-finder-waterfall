@@ -9,7 +9,8 @@ from typing import Any, Callable
 
 from domain_waterfall import http_client
 from domain_waterfall.config import settings
-from domain_waterfall.normalize import extract_domain
+from domain_waterfall.gate import GLOBAL_BLOCKLIST, is_blocklisted
+from domain_waterfall.normalize import distinctive_tokens, domain_name_part, extract_domain
 from domain_waterfall.concurrency import (
     VendorCallTimeout,
     VendorThrottle,
@@ -308,18 +309,28 @@ def _item_for_query(by_query: dict[str, dict[str, Any]], q: str) -> dict[str, An
     return None
 
 
-def _domain_from_organic(item: dict[str, Any]) -> tuple[str, str]:
+def build_serp_query(name: str, city: str = "", state: str = "") -> str:
+    """Always company + city + state. Never the company name alone."""
+    return " ".join(p for p in ((name or "").strip(), (city or "").strip(), (state or "").strip()) if p)
+
+
+def _domain_from_organic(item: dict[str, Any], company_name: str = "") -> tuple[str, str]:
     organic = item.get("organicResults") or item.get("organic") or []
     if not isinstance(organic, list):
         return "", ""
+    toks = distinctive_tokens(company_name, [])
     for hit in organic:
         if not isinstance(hit, dict):
             continue
         url = str(hit.get("url") or hit.get("link") or "")
         domain = extract_domain(url)
+        if not domain or is_blocklisted(domain, GLOBAL_BLOCKLIST):
+            continue
         title = str(hit.get("title") or "")
-        if domain:
-            return domain, title
+        part = domain_name_part(domain)
+        if toks and not any(tok in part for tok in toks):
+            continue
+        return domain, title
     return "", ""
 
 
@@ -350,7 +361,11 @@ def _resolve_chunk(
     hits_n = 0
     for q in queries:
         item = _item_for_query(by_query, q["q"])
-        domain, title = _domain_from_organic(item) if isinstance(item, dict) else ("", "")
+        domain, title = (
+            _domain_from_organic(item, company_name=q.get("name") or "")
+            if isinstance(item, dict)
+            else ("", "")
+        )
         if not domain:
             none_n += 1
             packed.append({"key": q["key"], "none": True})
@@ -391,9 +406,8 @@ def resolve_rows(
     should_stop: StopFn | None = None,
     concurrency: int | None = None,
 ) -> TierResult:
-    inputs = ["company_name"]
-    if with_location:
-        inputs.extend(["city", "state"])
+    # Location is always on the SERP query when the row has it. geo_in_query does not apply.
+    inputs = ["company_name", "city", "state"]
     result = TierResult(
         tier="serp",
         inputs_passed=inputs,
@@ -407,11 +421,9 @@ def resolve_rows(
     queries: list[dict[str, str]] = []
     for row in rows:
         name = str(row.get("company_name") or "").strip()
-        city = str(row.get("city") or "").strip() if with_location else ""
-        state = str(row.get("state") or "").strip() if with_location else ""
-        q = f'"{name}"'
-        if city or state:
-            q = f'"{name}" {city} {state}'.strip()
+        city = str(row.get("city") or "").strip()
+        state = str(row.get("state") or "").strip()
+        q = build_serp_query(name, city, state)
         queries.append({"key": str(row.get("_source_key")), "q": q, "name": name})
 
     chunks = chunked(queries, SERP_CHUNK)

@@ -13,8 +13,74 @@ def _peterson() -> ProfileGate:
 
 
 def test_blocklist_and_gov() -> None:
+    from domain_waterfall.gate import GLOBAL_BLOCKLIST
+
     assert is_blocklisted("yelp.com", {"yelp"})
     assert is_blocklisted("dallas.gov", set())
+    assert is_blocklisted("waze.com", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("foo.cybo.com", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("seniorcare.com", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("seniorcareauthority.com", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("localbiznetwork.com", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("charitywater.org", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("eacsociety.org", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("yellowpages.com", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("facebook.com", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("mapquest.com", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("aplaceformom.com", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("healthgrades.com", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("zocdoc.com", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("www.niche.com", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("greatschools.org", GLOBAL_BLOCKLIST)
+    assert is_blocklisted("caring.com", GLOBAL_BLOCKLIST)
+    assert not is_blocklisted("summitbuilders.com", GLOBAL_BLOCKLIST)
+
+
+def test_title_match_does_not_accept_directory() -> None:
+    gate = ProfileGate(name_strip_tokens=["inc", "llc"], geo_required=False)
+    out = evaluate(
+        gate,
+        input_name="Oakridge Senior Living LLC",
+        domain="waze.com",
+        vendor_name="",
+        title="Oakridge Senior Living, Sacramento CA, Waze",
+    )
+    assert not out.accepted
+    assert out.reason in {"blocklist", "token"}
+
+
+def test_domain_tokens_score_up_and_none_share_rejected() -> None:
+    gate = ProfileGate(name_strip_tokens=["inc", "llc"], geo_required=False)
+    hit = evaluate(
+        gate,
+        input_name="Oakridge Senior Living LLC",
+        domain="oakridgeseniorliving.com",
+        vendor_name="",
+        title="Oakridge Senior Living",
+    )
+    assert hit.accepted
+    assert hit.token_hit
+    assert hit.confidence >= 0.7
+
+    miss = evaluate(
+        gate,
+        input_name="Oakridge Senior Living LLC",
+        domain="unrelatedwidgetsfactory.com",
+        vendor_name="",
+        title="Oakridge Senior Living, a local machine shop",
+    )
+    assert not miss.accepted
+    assert miss.reason == "token"
+
+    listed = evaluate(
+        gate,
+        input_name="Oakridge Senior Living LLC",
+        domain="machinist.com",
+        vendor_name="",
+        title="Oakridge Senior Living, a local machine shop",
+    )
+    assert not listed.accepted
+    assert listed.reason == "blocklist"
 
 
 def test_token_and_industry_reject() -> None:
@@ -91,7 +157,10 @@ def test_sinks() -> None:
         {
             "buildzoom.com": {"a", "b", "c", "d"},
             "good.com": {"a"},
+            "almost.com": {"one", "two", "three"},
         }
     )
     assert "buildzoom.com" in sinks
     assert "good.com" not in sinks
+    # More than 3 unrelated companies in one run. Three names stay.
+    assert "almost.com" not in sinks
