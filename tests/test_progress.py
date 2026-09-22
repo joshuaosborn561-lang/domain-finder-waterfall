@@ -26,3 +26,12 @@ def test_row_ticker_emits_first_last_and_throttles() -> None:
     assert seen[-1]["targets"] == 10
     assert seen[-1]["rows_attempted"] == 10
     assert "last_progress_at" in seen[-1]
+
+
+def test_row_ticker_passes_serp_run_ids() -> None:
+    seen: list[dict] = []
+    tick = make_row_ticker(seen.append, min_interval_s=0.0)
+    tick(0, 10, 0, {"serp_run_ids": ["abc"], "tier_cost_usd": 0.45, "last_progress_at": "t1"})
+    assert seen[-1]["serp_run_ids"] == ["abc"]
+    assert seen[-1]["tier_cost_usd"] == 0.45
+    assert seen[-1]["last_progress_at"] == "t1"

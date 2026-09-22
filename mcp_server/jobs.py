@@ -160,8 +160,13 @@ def update_job_progress(job_id: str, snapshot: dict[str, Any]) -> None:
     _persist(job)
 
 
+def _progress_stamp(job: Job) -> str:
+    return str((job.result or {}).get("last_progress_at") or "")
+
+
 def _stall_watch(job_id: str, cancel: threading.Event) -> None:
     last_seen_requests: int | None = None
+    last_seen_stamp = ""
     last_move = time.time()
     while not cancel.wait(STALL_POLL_SECONDS):
         with _lock:
@@ -169,8 +174,14 @@ def _stall_watch(job_id: str, cancel: threading.Event) -> None:
         if job is None or job.status != "running":
             return
         made = _requests_made(job)
-        if last_seen_requests is None or made != last_seen_requests:
+        stamp = _progress_stamp(job)
+        if (
+            last_seen_requests is None
+            or made != last_seen_requests
+            or stamp != last_seen_stamp
+        ):
             last_seen_requests = made
+            last_seen_stamp = stamp
             last_move = time.time()
             continue
         # Also require that we are inside a tier that should be making requests.

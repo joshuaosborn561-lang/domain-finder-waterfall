@@ -1,9 +1,15 @@
+import time
 from unittest.mock import MagicMock
 
 import pytest
 
 from domain_waterfall.concurrency import VendorTransportError
 from domain_waterfall.vendors import serp
+
+
+@pytest.fixture(autouse=True)
+def _serp_runs_dir(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(serp, "RUNS_DIR", tmp_path / "serp_runs")
 
 
 def _resp(status: int, payload: object, text: str = "") -> MagicMock:
@@ -74,9 +80,13 @@ def test_poll_budget_covers_slow_batch() -> None:
 
 def test_start_run_is_async_no_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     posted: list[str] = []
+    bodies: list[dict] = []
 
-    def fake_post(_tier: str, url: str, **_k: object) -> MagicMock:
+    def fake_post(_tier: str, url: str, **kwargs: object) -> MagicMock:
         posted.append(url)
+        body = kwargs.get("json")
+        if isinstance(body, dict):
+            bodies.append(body)
         return _resp(201, {"data": {"id": "run123", "status": "RUNNING"}})
 
     monkeypatch.setattr(serp.settings, "apify_token", "tok")
@@ -85,14 +95,17 @@ def test_start_run_is_async_no_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     assert run_id == "run123"
     assert posted
     assert "waitForFinish" not in posted[0]
-    assert posted[0].endswith("/runs")
+    assert posted[0].split("?")[0].endswith("/runs")
+    assert "memory=4096" in posted[0]
+    assert bodies and bodies[0]["saveHtml"] is False
+    assert bodies[0]["saveHtmlToKeyValueStore"] is False
 
 
 def test_poll_waits_until_succeeded(monkeypatch: pytest.MonkeyPatch) -> None:
     states = iter(
         [
-            _resp(200, {"data": {"status": "RUNNING", "defaultDatasetId": "ds1"}}),
-            _resp(200, {"data": {"status": "SUCCEEDED", "defaultDatasetId": "ds1"}}),
+            _resp(200, {"data": {"id": "run123", "status": "RUNNING", "defaultDatasetId": "ds1"}}),
+            _resp(200, {"data": {"id": "run123", "status": "SUCCEEDED", "defaultDatasetId": "ds1"}}),
             _resp(
                 200,
                 [
@@ -116,7 +129,7 @@ def test_poll_waits_until_succeeded(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_poll_timeout_includes_status_and_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_get(_tier: str, url: str, **_k: object) -> MagicMock:
-        return _resp(200, {"data": {"status": "RUNNING", "defaultDatasetId": "ds1"}})
+        return _resp(200, {"data": {"id": "run123", "status": "RUNNING", "defaultDatasetId": "ds1"}})
 
     monkeypatch.setattr(serp.http_client, "get", fake_get)
     monkeypatch.setattr(serp, "SERP_POLL_INTERVAL_S", 0.0)
@@ -135,7 +148,7 @@ def test_poll_failed_run_surfaces_status(monkeypatch: pytest.MonkeyPatch) -> Non
     def fake_get(_tier: str, url: str, **_k: object) -> MagicMock:
         return _resp(
             200,
-            {"data": {"status": "FAILED", "statusMessage": "actor crashed", "defaultDatasetId": "ds1"}},
+            {"data": {"id": "run123", "status": "FAILED", "statusMessage": "actor crashed", "defaultDatasetId": "ds1"}},
         )
 
     monkeypatch.setattr(serp.http_client, "get", fake_get)
@@ -214,3 +227,139 @@ def test_transport_error_logs_fields(caplog: pytest.LogCaptureFixture) -> None:
     assert "timeout=30s" in text
     assert "gateway timeout" in text
     assert any("status=504" in r.message for r in caplog.records)
+
+
+def test_poll_heartbeats_ready_and_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    notes: list[tuple[str, str]] = []
+    states = iter(
+        [
+            _resp(200, {"data": {"id": "own1", "status": "READY", "defaultDatasetId": "ds1"}}),
+            _resp(200, {"data": {"id": "own1", "status": "RUNNING", "defaultDatasetId": "ds1"}}),
+            _resp(200, {"data": {"id": "own1", "status": "SUCCEEDED", "defaultDatasetId": "ds1"}}),
+            _resp(200, [{"searchQuery": {"term": "Acme"}, "organicResults": []}]),
+        ]
+    )
+    monkeypatch.setattr(serp.http_client, "get", lambda *_a, **_k: next(states))
+    monkeypatch.setattr(serp, "SERP_POLL_INTERVAL_S", 0.0)
+    items = serp._poll(
+        "own1",
+        n_queries=1,
+        on_status=lambda rid, st, _b: notes.append((rid, st)),
+    )
+    assert items == [{"searchQuery": {"term": "Acme"}, "organicResults": []}]
+    assert notes == [("own1", "READY"), ("own1", "RUNNING"), ("own1", "SUCCEEDED")]
+
+
+def test_poll_ignores_foreign_run_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    notes: list[str] = []
+    states = iter(
+        [
+            _resp(200, {"data": {"id": "rgwdodcuitqW23ZFj", "status": "SUCCEEDED", "defaultDatasetId": "other"}}),
+            _resp(200, {"data": {"id": "own1", "status": "SUCCEEDED", "defaultDatasetId": "ds1"}}),
+            _resp(200, [{"searchQuery": {"term": "Acme"}}]),
+        ]
+    )
+    monkeypatch.setattr(serp.http_client, "get", lambda *_a, **_k: next(states))
+    monkeypatch.setattr(serp, "SERP_POLL_INTERVAL_S", 0.0)
+    items = serp._poll("own1", n_queries=1, on_status=lambda rid, st, _b: notes.append(rid))
+    assert items == [{"searchQuery": {"term": "Acme"}}]
+    assert notes == ["own1"]
+
+
+def test_run_url_refuses_last() -> None:
+    with pytest.raises(VendorTransportError):
+        serp._run_url("last")
+    with pytest.raises(VendorTransportError):
+        serp._run_url("")
+
+
+def test_started_run_is_billed_when_poll_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(serp.settings, "apify_token", "tok")
+    monkeypatch.setattr(serp, "cache_schema", lambda: {})
+    monkeypatch.setattr(serp, "_start_run", lambda _q: "cSSnS3yzvUDmTcZIe")
+
+    def fake_poll(run_id: str, **_k: object) -> list:
+        raise VendorTransportError("serp", status="RUNNING", message="stopped during poll")
+
+    def fake_collect(run_id: str, *, tracker: object | None = None) -> list | None:
+        assert run_id == "cSSnS3yzvUDmTcZIe"
+        if tracker is not None:
+            tracker.update(run_id, status="SUCCEEDED", collected=True)  # type: ignore[attr-defined]
+        return [
+            {
+                "searchQuery": {"term": "Acme Austin TX"},
+                "organicResults": [{"url": "https://acme.com", "title": "Acme"}],
+            }
+        ]
+
+    monkeypatch.setattr(serp, "_poll", fake_poll)
+    monkeypatch.setattr(serp, "collect_run", fake_collect)
+    import domain_waterfall.tier_pool as pool
+
+    monkeypatch.setattr(pool, "ROW_ERROR_RETRIES", 1)
+    snaps: list[dict] = []
+
+    def on_progress(_p: int, _t: int, _h: int, extra: dict | None = None) -> None:
+        if extra:
+            snaps.append(dict(extra))
+
+    out = serp.resolve_rows(
+        [{"_source_key": "1", "company_name": "Acme", "city": "Austin", "state": "TX"}],
+        unit=0.0045,
+        concurrency=1,
+        on_progress=on_progress,
+    )
+    assert out.cost_usd == 0.0045
+    assert "1" in out.candidates
+    assert any(s.get("serp_run_ids") == ["cSSnS3yzvUDmTcZIe"] for s in snaps)
+
+
+def test_resume_reuses_run_id_instead_of_starting(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(serp.settings, "apify_token", "tok")
+    monkeypatch.setattr(serp, "cache_schema", lambda: {})
+    starts: list[str] = []
+
+    def fake_start(queries: list[dict[str, str]]) -> str:
+        starts.append("new")
+        return "fresh"
+
+    rec = serp.SerpRunRecord(
+        run_id="Z3wGgUajlbgdWtNTJ",
+        chunk_key="serp_chunk_0",
+        fingerprint=serp.chunk_fingerprint([{"q": "Acme Austin TX"}]),
+        query_count=1,
+        cost_usd=0.0045,
+        queries=[{"key": "1", "q": "Acme Austin TX", "name": "Acme"}],
+        status="SUCCEEDED",
+        dataset_id="ds9",
+        started_at=time.time(),
+    )
+    serp._persist_run(rec)
+    monkeypatch.setattr(serp, "_start_run", fake_start)
+    monkeypatch.setattr(
+        serp,
+        "_poll",
+        lambda run_id, **_k: (
+            [
+                {
+                    "searchQuery": {"term": "Acme Austin TX"},
+                    "organicResults": [{"url": "https://acme.com", "title": "Acme"}],
+                }
+            ]
+            if run_id == "Z3wGgUajlbgdWtNTJ"
+            else []
+        ),
+    )
+    out = serp.resolve_rows(
+        [{"_source_key": "1", "company_name": "Acme", "city": "Austin", "state": "TX"}],
+        concurrency=1,
+    )
+    assert starts == []
+    assert out.cost_usd == 0.0045
+    assert "1" in out.candidates
+
+
+def test_poll_refuses_unowned_run_when_tracker_set() -> None:
+    tracker = serp.SerpRunTracker()
+    with pytest.raises(VendorTransportError):
+        serp._poll("rgwdodcuitqW23ZFj", n_queries=1, tracker=tracker)

@@ -41,6 +41,45 @@ def test_stall_on_flat_requests_made(monkeypatch: pytest.MonkeyPatch, tmp_path) 
     assert later["status"] == "stalled"
 
 
+def test_last_progress_at_heartbeat_is_not_a_stall(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setattr(jobs, "STALL_SECONDS", 0.25)
+    monkeypatch.setattr(jobs, "STALL_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(jobs, "JOBS_DIR", tmp_path)
+
+    def beating(job: jobs.Job) -> dict:
+        end = time.time() + 0.8
+        n = 0
+        while time.time() < end:
+            n += 1
+            jobs.update_job_progress(
+                job.id,
+                {
+                    "phase": "tier",
+                    "tier": "serp",
+                    "requests_made": 2,
+                    "processed": 0,
+                    "status": "running",
+                    "last_progress_at": f"2026-09-22T14:43:{n:02d}Z",
+                    "serp_run_ids": ["cSSnS3yzvUDmTcZIe"],
+                },
+            )
+            time.sleep(0.05)
+        return {"ok": True, "status": "completed", "tiers": [], "spent_usd": 0.9}
+
+    job = jobs.start_job("heartbeat-test", beating)
+    deadline = time.time() + 2.0
+    payload = jobs.get_job(job.id)
+    while time.time() < deadline:
+        payload = jobs.get_job(job.id)
+        if payload["status"] in {"completed", "stalled", "failed"}:
+            break
+        time.sleep(0.05)
+    assert payload["status"] == "completed"
+    assert payload["status"] != "stalled"
+
+
 def test_cancel_job_is_sticky(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     monkeypatch.setattr(jobs, "JOBS_DIR", tmp_path)
     monkeypatch.setattr(jobs, "STALL_SECONDS", 60)

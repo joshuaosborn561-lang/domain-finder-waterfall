@@ -118,8 +118,17 @@ def make_row_ticker(
                 "requests_made": extra.get("requests_made", 0),
                 "errored": extra.get("errored", 0),
                 "none": extra.get("none", 0),
-                "last_progress_at": utc_now_iso(),
+                "last_progress_at": extra.get("last_progress_at") or utc_now_iso(),
             }
+            for key in (
+                "serp_run_ids",
+                "serp_runs",
+                "tier_cost_usd",
+                "serp_poll_run_id",
+                "serp_poll_status",
+            ):
+                if key in extra:
+                    payload[key] = extra[key]
         emit(payload)
 
     return tick
@@ -445,6 +454,9 @@ def resolve_domain(
             snap.update(extra)
         if "last_progress_at" not in (extra or {}):
             snap["last_progress_at"] = utc_now_iso()
+        tier_cost = extra.get("tier_cost_usd") if extra else None
+        if isinstance(tier_cost, (int, float)):
+            snap["spent_usd"] = round(spent + float(tier_cost), 4)
         progress(snap)
 
     emit({"phase": "start", "estimate_usd": estimate["estimated_usd"]})
