@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
+import threading
 import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from domain_waterfall import http_client
@@ -30,6 +36,7 @@ _SCHEMA: dict[str, Any] | None = None
 _SCHEMA_FAILED = False
 
 StopFn = Callable[[], bool]
+StatusFn = Callable[[str, str, dict[str, Any]], None]
 SERP_CHUNK = 100
 # A single google-search-scraper query is 45s plus. 120s was too short for a batch.
 SERP_POLL_INTERVAL_S = 5.0
@@ -38,7 +45,12 @@ SERP_POLL_PER_QUERY_S = 50.0
 SERP_POLL_CAP_S = 45 * 60
 SERP_START_TIMEOUT_S = 30
 SERP_DEFAULT_RUN_CONCURRENCY = 2
+SERP_MEMORY_MB = 4096
+SERP_RUN_REUSE_S = 6 * 3600
 RUNS_URL = "https://api.apify.com/v2/acts/{actor}/runs"
+ALIVE_STATUSES = frozenset({"READY", "RUNNING"})
+DONE_OK = "SUCCEEDED"
+DONE_BAD = frozenset({"FAILED", "ABORTED", "TIMED-OUT"})
 
 
 def _actor_id() -> str:
@@ -89,13 +101,176 @@ def live_unit_price() -> tuple[float, dict[str, Any]]:
     return unit, info
 
 
+def _utc_now_iso() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+RUNS_DIR: Path | None = None
+
+
+def _runs_dir() -> Path:
+    path = RUNS_DIR if RUNS_DIR is not None else Path(__file__).resolve().parents[2] / "data" / "serp_runs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def chunk_fingerprint(queries: list[dict[str, str]]) -> str:
+    blob = "\n".join(str(q.get("q") or "") for q in queries)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:24]
+
+
 def _runs_url() -> str:
     # No waitForFinish: return runId immediately. A sync wait dies on a 30s HTTP timeout.
-    return RUNS_URL.format(actor=_actor_id())
+    # memory=4096: 100 queries were 368s with default memory; HTML snapshots fill KV.
+    return f"{RUNS_URL.format(actor=_actor_id())}?memory={SERP_MEMORY_MB}"
 
 
 def _run_url(run_id: str) -> str:
-    return f"https://api.apify.com/v2/actor-runs/{run_id}"
+    rid = str(run_id or "").strip()
+    if not rid or rid.lower() in {"last", "latest"} or "/" in rid or "?" in rid:
+        raise VendorTransportError("serp", message="refusing to poll a non owned run id")
+    return f"https://api.apify.com/v2/actor-runs/{rid}"
+
+
+@dataclass
+class SerpRunRecord:
+    run_id: str
+    chunk_key: str
+    fingerprint: str
+    query_count: int
+    cost_usd: float
+    queries: list[dict[str, str]] = field(default_factory=list)
+    status: str = ""
+    dataset_id: str = ""
+    collected: bool = False
+    started_at: float = field(default_factory=time.time)
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "chunk_key": self.chunk_key,
+            "query_count": self.query_count,
+            "cost_usd": round(self.cost_usd, 6),
+            "status": self.status,
+            "dataset_id": self.dataset_id,
+            "collected": self.collected,
+        }
+
+
+class SerpRunTracker:
+    """Own run ids for this job. Persist so stall/resume can collect, not re query."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.records: dict[str, SerpRunRecord] = {}
+
+    def add(self, rec: SerpRunRecord) -> SerpRunRecord:
+        with self._lock:
+            self.records[rec.run_id] = rec
+        _persist_run(rec)
+        return rec
+
+    def get(self, run_id: str) -> SerpRunRecord | None:
+        with self._lock:
+            return self.records.get(run_id)
+
+    def owned(self, run_id: str) -> bool:
+        with self._lock:
+            return run_id in self.records
+
+    def update(
+        self,
+        run_id: str,
+        *,
+        status: str = "",
+        dataset_id: str = "",
+        collected: bool | None = None,
+    ) -> None:
+        with self._lock:
+            rec = self.records.get(run_id)
+            if rec is None:
+                return
+            if status:
+                rec.status = status
+            if dataset_id:
+                rec.dataset_id = dataset_id
+            if collected is not None:
+                rec.collected = collected
+            snap = rec
+        _persist_run(snap)
+
+    def run_ids(self) -> list[str]:
+        with self._lock:
+            return list(self.records)
+
+    def uncollected(self) -> list[SerpRunRecord]:
+        with self._lock:
+            return [r for r in self.records.values() if not r.collected]
+
+    def cost_usd(self) -> float:
+        with self._lock:
+            return sum(r.cost_usd for r in self.records.values())
+
+    def public(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [r.public() for r in self.records.values()]
+
+
+def _persist_run(rec: SerpRunRecord) -> None:
+    payload = {
+        **rec.public(),
+        "fingerprint": rec.fingerprint,
+        "queries": rec.queries,
+        "started_at": rec.started_at,
+    }
+    folder = _runs_dir()
+    (folder / f"{rec.run_id}.json").write_text(
+        json.dumps(payload, indent=2), encoding="utf-8"
+    )
+    (folder / f"fp-{rec.fingerprint}.json").write_text(
+        json.dumps({"run_id": rec.run_id, "started_at": rec.started_at}),
+        encoding="utf-8",
+    )
+
+
+def load_reusable_run(fingerprint: str) -> SerpRunRecord | None:
+    path = _runs_dir() / f"fp-{fingerprint}.json"
+    if not path.exists():
+        return None
+    try:
+        idx = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    run_id = str(idx.get("run_id") or "")
+    started = float(idx.get("started_at") or 0)
+    if not run_id or time.time() - started > SERP_RUN_REUSE_S:
+        return None
+    raw_path = _runs_dir() / f"{run_id}.json"
+    if not raw_path.exists():
+        return None
+    try:
+        raw = json.loads(raw_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if str(raw.get("status") or "") in DONE_BAD:
+        return None
+    return SerpRunRecord(
+        run_id=run_id,
+        chunk_key=str(raw.get("chunk_key") or ""),
+        fingerprint=fingerprint,
+        query_count=int(raw.get("query_count") or 0),
+        cost_usd=float(raw.get("cost_usd") or 0),
+        queries=list(raw.get("queries") or []),
+        status=str(raw.get("status") or ""),
+        dataset_id=str(raw.get("dataset_id") or ""),
+        collected=bool(raw.get("collected")),
+        started_at=started,
+    )
 
 
 def poll_budget_s(n_queries: int) -> float:
@@ -112,6 +287,8 @@ def _start_run(queries: list[dict[str, str]]) -> str:
         "mobileResults": False,
         "languageCode": "en",
         "countryCode": "us",
+        "saveHtml": False,
+        "saveHtmlToKeyValueStore": False,
     }
     try:
         r = http_client.post(
@@ -183,77 +360,36 @@ def _start_run(queries: list[dict[str, str]]) -> str:
     run_id = str((run or {}).get("id") or "")
     if not run_id:
         raise VendorTransportError("serp", message="missing run id", url=url)
-    log.info("serp started run_id=%s queries=%s", run_id, len(queries))
+    status = str((run or {}).get("status") or "")
+    log.info("serp started run_id=%s queries=%s status=%s", run_id, len(queries), status)
     return run_id
 
 
-def _poll(
-    run_id: str,
-    *,
-    n_queries: int,
-    deadline: float | None = None,
-) -> list[dict[str, Any]]:
-    url = _run_url(run_id)
-    budget = poll_budget_s(n_queries)
-    started = time.monotonic()
-    last_status = ""
-    dataset_id = ""
-    while time.monotonic() - started < budget:
-        if deadline is not None and time.monotonic() >= deadline:
-            raise VendorTransportError(
-                "serp",
-                status=last_status or "deadline",
-                message="job deadline during poll",
-                timeout=round(time.monotonic() - started, 1),
-                url=url,
-            )
-        try:
-            r = http_client.get("serp", url, headers=_headers(), timeout=20)
-        except VendorCallTimeout as exc:
-            log.warning("serp poll http timeout run_id=%s, %s", run_id, exc)
-            time.sleep(SERP_POLL_INTERVAL_S)
-            continue
-        except VendorTransportError:
-            raise
-        if r is None:
-            time.sleep(SERP_POLL_INTERVAL_S)
-            continue
-        if r.status_code == 429:
-            raise VendorThrottle("serp", "poll 429")
-        try:
-            data = r.json()
-        except ValueError:
-            time.sleep(SERP_POLL_INTERVAL_S)
-            continue
-        body = data.get("data") if isinstance(data, dict) else {}
-        body = body if isinstance(body, dict) else {}
-        last_status = str(body.get("status") or "")
-        dataset_id = str(body.get("defaultDatasetId") or dataset_id)
-        if last_status == "SUCCEEDED":
-            break
-        if last_status in {"FAILED", "ABORTED", "TIMED-OUT"}:
-            raise VendorTransportError(
-                "serp",
-                status=last_status,
-                message=str(body.get("statusMessage") or last_status),
-                url=url,
-            )
-        time.sleep(SERP_POLL_INTERVAL_S)
-    else:
-        raise VendorTransportError(
-            "serp",
-            status=last_status or "RUNNING",
-            message="poll timeout",
-            timeout=budget,
-            url=url,
-        )
-    if not dataset_id:
-        raise VendorTransportError(
-            "serp",
-            status=last_status or "SUCCEEDED",
-            message="missing dataset id",
-            url=url,
-        )
+def _response_run_id(body: dict[str, Any]) -> str:
+    return str(body.get("id") or "").strip()
+
+
+def _own_run_body(run_id: str, data: Any) -> dict[str, Any] | None:
+    """Accept a poll payload only when it is this run_id. Never a list or last run."""
+    if not isinstance(data, dict):
+        return None
+    body = data.get("data") if isinstance(data.get("data"), dict) else data
+    if not isinstance(body, dict):
+        return None
+    if "items" in body and "id" not in body:
+        log.warning("serp poll ignored run list wanted=%s", run_id)
+        return None
+    got = _response_run_id(body)
+    if not got:
+        log.warning("serp poll missing run id wanted=%s", run_id)
+        return None
+    if got != run_id:
+        log.warning("serp poll ignored foreign run id=%s wanted=%s", got, run_id)
+        return None
+    return body
+
+
+def _fetch_dataset(dataset_id: str) -> list[dict[str, Any]]:
     items_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?clean=true"
     r = http_client.get("serp", items_url, headers=_headers(), timeout=45)
     if r is None:
@@ -277,13 +413,139 @@ def _poll(
         items = r.json()
     except ValueError as exc:
         raise VendorTransportError("serp", message="dataset json", url=items_url) from exc
+    return items if isinstance(items, list) else []
+
+
+def _get_own_run(run_id: str) -> dict[str, Any] | None:
+    url = _run_url(run_id)
+    try:
+        r = http_client.get("serp", url, headers=_headers(), timeout=20)
+    except VendorCallTimeout as exc:
+        log.warning("serp poll http timeout run_id=%s, %s", run_id, exc)
+        return None
+    if r is None:
+        return None
+    if r.status_code == 429:
+        raise VendorThrottle("serp", "poll 429")
+    try:
+        data = r.json()
+    except ValueError:
+        return None
+    return _own_run_body(run_id, data)
+
+
+def collect_run(run_id: str, *, tracker: SerpRunTracker | None = None) -> list[dict[str, Any]] | None:
+    """Fetch dataset for an owned SUCCEEDED run. Used on stall and resume."""
+    if tracker is not None and not tracker.owned(run_id):
+        log.warning("serp collect refused foreign run id=%s", run_id)
+        return None
+    body = _get_own_run(run_id)
+    if not body:
+        return None
+    status = str(body.get("status") or "")
+    dataset_id = str(body.get("defaultDatasetId") or "")
+    if tracker is not None:
+        tracker.update(run_id, status=status, dataset_id=dataset_id)
+    if status != DONE_OK:
+        return None
+    if not dataset_id:
+        return None
+    items = _fetch_dataset(dataset_id)
+    if tracker is not None:
+        tracker.update(run_id, status=DONE_OK, dataset_id=dataset_id, collected=True)
+    log.info("serp run_id=%s status=%s items=%s", run_id, DONE_OK, len(items))
+    return items
+
+
+def _poll(
+    run_id: str,
+    *,
+    n_queries: int,
+    deadline: float | None = None,
+    should_stop: StopFn | None = None,
+    on_status: StatusFn | None = None,
+    tracker: SerpRunTracker | None = None,
+) -> list[dict[str, Any]]:
+    if tracker is not None and not tracker.owned(run_id):
+        raise VendorTransportError("serp", message="poll refused, run id is not owned")
+    url = _run_url(run_id)
+    budget = poll_budget_s(n_queries)
+    started = time.monotonic()
+    last_status = ""
+    dataset_id = ""
+
+    def _note(body: dict[str, Any]) -> None:
+        nonlocal last_status, dataset_id
+        last_status = str(body.get("status") or "")
+        dataset_id = str(body.get("defaultDatasetId") or dataset_id)
+        if tracker is not None:
+            tracker.update(run_id, status=last_status, dataset_id=dataset_id)
+        if last_status in ALIVE_STATUSES or last_status == DONE_OK:
+            if on_status:
+                on_status(run_id, last_status, body)
+
+    while time.monotonic() - started < budget:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise VendorTransportError(
+                "serp",
+                status=last_status or "deadline",
+                message="job deadline during poll",
+                timeout=round(time.monotonic() - started, 1),
+                url=url,
+            )
+        stopping = bool(should_stop and should_stop())
+        try:
+            body = _get_own_run(run_id)
+        except VendorThrottle:
+            raise
+        except VendorTransportError:
+            raise
+        if body:
+            _note(body)
+            if last_status == DONE_OK:
+                break
+            if last_status in DONE_BAD:
+                raise VendorTransportError(
+                    "serp",
+                    status=last_status,
+                    message=str(body.get("statusMessage") or last_status),
+                    url=url,
+                )
+        if stopping:
+            if last_status == DONE_OK:
+                break
+            raise VendorTransportError(
+                "serp",
+                status=last_status or "RUNNING",
+                message="stopped during poll",
+                url=url,
+            )
+        time.sleep(SERP_POLL_INTERVAL_S)
+    else:
+        raise VendorTransportError(
+            "serp",
+            status=last_status or "RUNNING",
+            message="poll timeout",
+            timeout=budget,
+            url=url,
+        )
+    if not dataset_id:
+        raise VendorTransportError(
+            "serp",
+            status=last_status or DONE_OK,
+            message="missing dataset id",
+            url=url,
+        )
+    items = _fetch_dataset(dataset_id)
+    if tracker is not None:
+        tracker.update(run_id, status=DONE_OK, dataset_id=dataset_id, collected=True)
     log.info(
         "serp run_id=%s status=%s items=%s",
         run_id,
-        last_status or "SUCCEEDED",
-        len(items) if isinstance(items, list) else 0,
+        last_status or DONE_OK,
+        len(items),
     )
-    return items if isinstance(items, list) else []
+    return items
 
 
 def _query_term(item: dict[str, Any]) -> str:
@@ -334,20 +596,12 @@ def _domain_from_organic(item: dict[str, Any], company_name: str = "") -> tuple[
     return "", ""
 
 
-def _resolve_chunk(
-    chunk_row: dict[str, Any],
+def _pack_items(
+    queries: list[dict[str, str]],
+    items: list[dict[str, Any]],
     *,
     unit: float,
-    inputs: list[str],
-    deadline: float | None = None,
-) -> RowWorkResult:
-    """One Apify chunk. chunk_row holds queries under _queries and a synthetic key."""
-    queries: list[dict[str, str]] = list(chunk_row.get("_queries") or [])
-    key = str(chunk_row.get("_source_key"))
-    if not queries:
-        return RowWorkResult(key=key, none=True, requests=0)
-    run_id = _start_run(queries)
-    items = _poll(run_id, n_queries=len(queries), deadline=deadline)
+) -> list[dict[str, Any]]:
     by_query: dict[str, dict[str, Any]] = {}
     for item in items:
         if not isinstance(item, dict):
@@ -355,10 +609,7 @@ def _resolve_chunk(
         search = _query_term(item)
         if search:
             by_query[search] = item
-    # Pack per query outcomes into raw for the aggregator.
     packed: list[dict[str, Any]] = []
-    none_n = 0
-    hits_n = 0
     for q in queries:
         item = _item_for_query(by_query, q["q"])
         domain, title = (
@@ -367,10 +618,8 @@ def _resolve_chunk(
             else ("", "")
         )
         if not domain:
-            none_n += 1
             packed.append({"key": q["key"], "none": True})
             continue
-        hits_n += 1
         packed.append(
             {
                 "key": q["key"],
@@ -379,20 +628,99 @@ def _resolve_chunk(
                 "cost_usd": unit,
             }
         )
-    # Represent the chunk as a synthetic candidate carrier via raw.
+    return packed
+
+
+def _ensure_run(
+    chunk_row: dict[str, Any],
+    queries: list[dict[str, str]],
+    *,
+    unit: float,
+    tracker: SerpRunTracker,
+) -> SerpRunRecord:
+    """Start once. Resume and retries reuse the stored run id."""
+    existing_id = str(chunk_row.get("_run_id") or "")
+    if existing_id and tracker.owned(existing_id):
+        rec = tracker.get(existing_id)
+        if rec is not None:
+            return rec
+    fp = chunk_fingerprint(queries)
+    reused = load_reusable_run(fp)
+    if reused is not None:
+        reused.chunk_key = str(chunk_row.get("_source_key") or reused.chunk_key)
+        reused.queries = queries
+        reused.query_count = len(queries)
+        if reused.cost_usd <= 0:
+            reused.cost_usd = unit * len(queries)
+        chunk_row["_run_id"] = reused.run_id
+        tracker.add(reused)
+        log.info("serp reuse run_id=%s queries=%s", reused.run_id, len(queries))
+        return reused
+    run_id = _start_run(queries)
+    rec = SerpRunRecord(
+        run_id=run_id,
+        chunk_key=str(chunk_row.get("_source_key") or ""),
+        fingerprint=fp,
+        query_count=len(queries),
+        cost_usd=unit * len(queries),
+        queries=queries,
+        status="READY",
+    )
+    chunk_row["_run_id"] = run_id
+    tracker.add(rec)
+    return rec
+
+
+def _resolve_chunk(
+    chunk_row: dict[str, Any],
+    *,
+    unit: float,
+    inputs: list[str],
+    deadline: float | None = None,
+    should_stop: StopFn | None = None,
+    on_status: StatusFn | None = None,
+    tracker: SerpRunTracker | None = None,
+) -> RowWorkResult:
+    """One Apify chunk. chunk_row holds queries under _queries and a synthetic key."""
+    queries: list[dict[str, str]] = list(chunk_row.get("_queries") or [])
+    key = str(chunk_row.get("_source_key"))
+    if not queries:
+        return RowWorkResult(key=key, none=True, requests=0)
+    store = tracker or SerpRunTracker()
+    rec = _ensure_run(chunk_row, queries, unit=unit, tracker=store)
+    if on_status:
+        on_status(rec.run_id, rec.status or "READY", {})
+    items = _poll(
+        rec.run_id,
+        n_queries=len(queries),
+        deadline=deadline,
+        should_stop=should_stop,
+        on_status=on_status,
+        tracker=store,
+    )
+    store.update(rec.run_id, status=DONE_OK, collected=True)
+    packed = _pack_items(queries, items, unit=unit)
+    none_n = sum(1 for p in packed if p.get("none"))
+    hits_n = len(packed) - none_n
     carrier = DomainCandidate(
         domain="",
         inputs_passed=inputs,
         billed=True,
-        cost_usd=unit * len(queries),
+        cost_usd=rec.cost_usd,
         credits=0.0,
-        raw={"serp_chunk": packed, "none": none_n, "hits": hits_n, "queries": len(queries)},
+        raw={
+            "serp_chunk": packed,
+            "none": none_n,
+            "hits": hits_n,
+            "queries": len(queries),
+            "run_id": rec.run_id,
+        },
     )
     return RowWorkResult(
         key=key,
         candidate=carrier,
         none=False,
-        requests=2 + len(queries),  # start + poll/dataset + billed queries
+        requests=2 + len(queries),
     )
 
 
@@ -435,20 +763,75 @@ def resolve_rows(
     else:
         workers = resolve_tier_concurrency("serp", concurrency)
 
-    def _one(chunk_row: dict[str, Any]) -> RowWorkResult:
-        return _resolve_chunk(chunk_row, unit=unit, inputs=inputs, deadline=deadline)
+    tracker = SerpRunTracker()
+    # Cost is billed when a run starts, not when the dataset lands.
+    billed_started = 0.0
 
-    report_progress(on_progress, 0, len(rows), 0, {"requests_made": 0, "errored": 0})
+    def heartbeat(run_id: str = "", status: str = "", _body: dict[str, Any] | None = None) -> None:
+        report_progress(
+            on_progress,
+            0,
+            len(rows),
+            0,
+            {
+                "requests_made": 0,
+                "errored": 0,
+                "last_progress_at": _utc_now_iso(),
+                "serp_run_ids": tracker.run_ids(),
+                "serp_runs": tracker.public(),
+                "tier_cost_usd": tracker.cost_usd(),
+                "serp_poll_run_id": run_id,
+                "serp_poll_status": status,
+            },
+        )
+
+    def _one(chunk_row: dict[str, Any]) -> RowWorkResult:
+        return _resolve_chunk(
+            chunk_row,
+            unit=unit,
+            inputs=inputs,
+            deadline=deadline,
+            should_stop=should_stop,
+            on_status=heartbeat,
+            tracker=tracker,
+        )
+
+    report_progress(
+        on_progress,
+        0,
+        len(rows),
+        0,
+        {
+            "requests_made": 0,
+            "errored": 0,
+            "last_progress_at": _utc_now_iso(),
+            "serp_run_ids": [],
+            "serp_runs": [],
+            "tier_cost_usd": 0.0,
+        },
+    )
     pooled = run_row_pool(
         chunk_rows,
         _one,
         tier="serp",
         concurrency=workers,
-        on_progress=None,  # remap progress onto row counts below
+        on_progress=None,
         should_stop=should_stop,
         deadline=deadline,
         result=result,
     )
+
+    # Stall/resume: collect finished datasets for runs we started, never start again.
+    harvested: dict[str, list[dict[str, Any]]] = {}
+    for rec in tracker.uncollected():
+        try:
+            items = collect_run(rec.run_id, tracker=tracker)
+        except (VendorTransportError, VendorThrottle) as exc:
+            log.warning("serp harvest run_id=%s failed, %s", rec.run_id, exc)
+            continue
+        if items is None:
+            continue
+        harvested[rec.chunk_key] = items
 
     # Unpack chunk carriers into per row candidates.
     final = TierResult(
@@ -463,13 +846,18 @@ def resolve_rows(
         credits=0.0,
         errored=pooled.errored,
     )
+    seen_keys: set[str] = set()
     done_rows = 0
-    for carrier in pooled.candidates.values():
-        packed = (carrier.raw or {}).get("serp_chunk") or []
+
+    def _apply_packed(packed: list[Any]) -> None:
+        nonlocal done_rows
         for item in packed:
             if not isinstance(item, dict):
                 continue
             key = str(item.get("key"))
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
             if item.get("none"):
                 final.none += 1
                 done_rows += 1
@@ -488,13 +876,22 @@ def resolve_rows(
                 billed=True,
                 cost_usd=cost,
             )
-            final.cost_usd += cost
             final.billed_calls += 1
             done_rows += 1
-    # Chunks that errored after retries: count their queries as errored, not none.
+
+    for carrier in pooled.candidates.values():
+        _apply_packed((carrier.raw or {}).get("serp_chunk") or [])
+    by_chunk = {str(row.get("_source_key")): row for row in chunk_rows}
+    for chunk_key, items in harvested.items():
+        qs = list((by_chunk.get(chunk_key) or {}).get("_queries") or [])
+        _apply_packed(_pack_items(qs, items, unit=unit))
+
+    # Started runs are billed even when the job stalls before unpack.
+    final.cost_usd = tracker.cost_usd()
+    billed_started = final.cost_usd
+    # Chunks that errored after retries: count leftover queries as errored, not none.
     errored_chunks = pooled.errored
     if errored_chunks:
-        # Approximate: each errored chunk covers up to SERP_CHUNK queries still unaccounted.
         remaining = len(rows) - done_rows
         take = min(remaining, errored_chunks * SERP_CHUNK)
         final.errored += take
@@ -511,6 +908,10 @@ def resolve_rows(
             "requests_made": final.calls,
             "errored": final.errored,
             "none": final.none,
+            "last_progress_at": _utc_now_iso(),
+            "serp_run_ids": tracker.run_ids(),
+            "serp_runs": tracker.public(),
+            "tier_cost_usd": billed_started,
         },
     )
     return final
