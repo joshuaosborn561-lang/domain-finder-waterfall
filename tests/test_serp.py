@@ -14,6 +14,56 @@ def _resp(status: int, payload: object, text: str = "") -> MagicMock:
     return r
 
 
+def test_query_is_name_city_state() -> None:
+    assert serp.build_serp_query("Acme", "Austin", "TX") == "Acme Austin TX"
+    assert serp.build_serp_query("Acme", "", "") == "Acme"
+    assert serp.build_serp_query("Acme", "Austin", "") == "Acme Austin"
+
+
+def test_organic_skips_sinks_and_requires_name_tokens() -> None:
+    item = {
+        "organicResults": [
+            {"url": "https://waze.com/place/1", "title": "Acme Plumbing, Austin"},
+            {"url": "https://foo.cybo.com/acme", "title": "Acme Plumbing"},
+            {"url": "https://machinist.com/shops/acme", "title": "Acme Plumbing"},
+            {"url": "https://eacsociety.org/members", "title": "Acme Plumbing"},
+            {"url": "https://acmeplumbing.com", "title": "Acme Plumbing"},
+        ]
+    }
+    domain, _title = serp._domain_from_organic(item, company_name="Acme Plumbing")
+    assert domain == "acmeplumbing.com"
+
+
+def test_resolve_rows_always_passes_city_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list[dict[str, str]]] = []
+
+    def fake_start(queries: list[dict[str, str]]) -> str:
+        seen.append(queries)
+        return "run1"
+
+    monkeypatch.setattr(serp.settings, "apify_token", "tok")
+    monkeypatch.setattr(serp, "cache_schema", lambda: {})
+    monkeypatch.setattr(serp, "_start_run", fake_start)
+    monkeypatch.setattr(
+        serp,
+        "_poll",
+        lambda *_a, **_k: [
+            {
+                "searchQuery": {"term": "Acme Austin TX"},
+                "organicResults": [{"url": "https://acme.com", "title": "Acme"}],
+            }
+        ],
+    )
+    out = serp.resolve_rows(
+        [{"_source_key": "1", "company_name": "Acme", "city": "Austin", "state": "TX"}],
+        with_location=False,
+        concurrency=1,
+    )
+    assert out.inputs_passed == ["company_name", "city", "state"]
+    assert seen and seen[0][0]["q"] == "Acme Austin TX"
+    assert "1" in out.candidates
+
+
 def test_poll_budget_covers_slow_batch() -> None:
     # One live query is 45s plus. 40 * 3s = 120s used to lose every 100-query run.
     assert serp.poll_budget_s(1) >= 900
