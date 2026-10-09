@@ -22,6 +22,8 @@ def test_parse_and_apply_filters() -> None:
     assert apply_tier_filters(tiers, min_tier="aiark", skip_tiers=["aiark"]) == ["discolike"]
     with pytest.raises(ValueError):
         apply_tier_filters(tiers, min_tier="nope")
+    assert apply_tier_filters(tiers, min_tier="leadmagic") == tiers
+    assert apply_tier_filters(["cache", "leadmagic", "maps"]) == ["cache", "maps"]
 
 
 def test_tier_budget_floor() -> None:
@@ -49,7 +51,6 @@ def _stub_resolve(monkeypatch: pytest.MonkeyPatch, ran: list[str]) -> None:
                 "discolike": 0.00425,
                 "serp": 0.0045,
                 "prospeo": 0.015,
-                "leadmagic": 0.015,
             },
             {},
         ),

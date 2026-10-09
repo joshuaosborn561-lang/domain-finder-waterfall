@@ -16,6 +16,10 @@ Source is always source_table + where, paged 500. No inline rows. Responses are 
 Writeback columns only: wf_domain, wf_domain_source, wf_domain_confidence, wf_domain_agreement,
 wf_domain_candidates, wf_phone, wf_domain_status.
 Never touch dl_status, sg_exclude, or skip_*.
+
+Tiers: cache → maps → aiark → discolike → serp → prospeo.
+LeadMagic company-search was dropped on 2026-10-08 with no replacement.
+Legacy 'leadmagic' in a profile or request tier_order is a no-op with a warning.
 """
 
 WHEN_TO_USE = """Use this MCP when you have a company name and a location and need a trusted website domain.

@@ -11,7 +11,14 @@ from . import supabase as sb
 from .config import load_settings
 from .gate import evaluate, sink_map
 from .normalize import extract_domain, normalize_name
-from .pricing import DEFAULT_PIPELINE, compute_order, estimate_rows
+from .pricing import (
+    DEFAULT_PIPELINE,
+    LEGACY_REMOVED_WARNING,
+    collect_legacy_tier_warnings,
+    compute_order,
+    estimate_rows,
+    is_removed_tier,
+)
 from .profiles import ClientProfile, get_profile
 from .source import (
     apply_column_overrides,
@@ -27,7 +34,7 @@ from .source import (
 
 log = logging.getLogger("domain_waterfall")
 from .tier_pool import WRITEBACK_CHUNK, chunked, resolve_tier_concurrency
-from .vendors import aiark, cache, discolike, leadmagic, maps, prospeo, serp
+from .vendors import aiark, cache, discolike, maps, prospeo, serp
 from .vendors.base import DomainCandidate, OnProgress, TierResult
 
 ProgressFn = Callable[[dict[str, Any]], None]
@@ -67,10 +74,15 @@ def apply_tier_filters(
     min_tier: str = "",
     skip_tiers: Any = None,
 ) -> list[str]:
-    """Drop skipped names and everything before min_tier in the current order."""
-    out = list(tiers)
-    skip = set(parse_skip_tiers(skip_tiers))
+    """Drop skipped names and everything before min_tier in the current order.
+
+    Legacy removed tiers (leadmagic) are stripped. min_tier=leadmagic is a no-op.
+    """
+    out = [t for t in tiers if not is_removed_tier(t)]
+    skip = {s for s in parse_skip_tiers(skip_tiers) if not is_removed_tier(s)}
     mt = (min_tier or "").strip().lower()
+    if is_removed_tier(mt):
+        mt = ""
     if mt:
         if mt not in out:
             raise ValueError(f"min_tier {mt!r} is not in the planned tier order {out}")
@@ -135,7 +147,7 @@ def make_row_ticker(
 
 FREE_ALWAYS = frozenset({"cache", "maps"})
 FREE_ON_MISS = frozenset({"prospeo"})
-PAID = frozenset({"aiark", "discolike", "serp", "leadmagic"})
+PAID = frozenset({"aiark", "discolike", "serp"})
 
 
 def load_private_keys() -> dict[str, str]:
@@ -161,7 +173,6 @@ def hydrate_keys() -> dict[str, bool]:
         "discolike": "DISCOLIKE_API_KEY",
         "aiark": "AI_ARK_API_KEY",
         "ai_ark": "AI_ARK_API_KEY",
-        "leadmagic": "LEADMAGIC_API_KEY",
         "prospeo": "PROSPEO_API_KEY",
         "apify": "APIFY_TOKEN",
         "rapidapi": "RAPIDAPI_KEY",
@@ -179,12 +190,10 @@ def hydrate_keys() -> dict[str, bool]:
     aiark.settings = cfg
     discolike.settings = cfg
     prospeo.settings = cfg
-    leadmagic.settings = cfg
     serp.settings = cfg
     return {
         "discolike": bool(cfg.discolike_api_key),
         "aiark": bool(cfg.ai_ark_api_key),
-        "leadmagic": bool(cfg.leadmagic_api_key),
         "prospeo": bool(cfg.prospeo_api_key),
         "serp": bool(cfg.apify_token),
         "maps": bool(cfg.rapidapi_key),
@@ -208,9 +217,6 @@ def live_prices() -> tuple[dict[str, float], dict[str, Any]]:
     pr_unit, pr_info = prospeo.live_unit_price()
     units["prospeo"] = pr_unit
     meta["prospeo"] = pr_info
-    lm_unit, lm_info = leadmagic.live_unit_price()
-    units["leadmagic"] = lm_unit
-    meta["leadmagic"] = lm_info
     return units, meta
 
 
@@ -269,10 +275,11 @@ def _run_tier(
             unit=units.get("prospeo", 0.015),
             on_progress=on_progress,
         )
-    if name == "leadmagic":
-        return leadmagic.resolve_rows(
-            rows, unit=units.get("leadmagic", 0.015), on_progress=on_progress
-        )
+    if is_removed_tier(name):
+        out = TierResult(tier=name)
+        out.skipped = "removed_tier"
+        out.billing = "no-op, leadmagic dropped 2026-10-08"
+        return out
     out = TierResult(tier=name)
     out.skipped = "unknown_tier"
     return out
@@ -322,9 +329,25 @@ def resolve_domain(
         dropped=profile.dropped_tiers,
         explicit_order=profile.explicit_tier_order,
     )
+    warnings = list(
+        dict.fromkeys(
+            collect_legacy_tier_warnings(
+                profile.enabled_tiers,
+                profile.explicit_tier_order,
+                min_tier=min_tier,
+                max_tier=max_tier,
+                skip_tiers=skip_tiers,
+            )
+            + list(order.warnings)
+        )
+    )
+    if warnings:
+        log.warning("%s", LEGACY_REMOVED_WARNING)
     if max_tier:
         stop = max_tier.strip().lower()
-        if stop in order.tiers:
+        if is_removed_tier(stop):
+            pass
+        elif stop in order.tiers:
             order.tiers = order.tiers[: order.tiers.index(stop) + 1]
 
     def _attach_estimate(n_rows: int, extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -341,6 +364,8 @@ def resolve_domain(
         payload["key_column"] = src.key_column
         payload["column_map"] = dict(src.column_map)
         payload["source_sql"] = describe_count_sql(src)
+        if warnings:
+            payload["warnings"] = list(warnings)
         if extra:
             payload.update(extra)
         return payload
@@ -729,6 +754,7 @@ def resolve_domain(
         "agreement_rate": round(counts["agreement"] / n, 4) if n else 0.0,
         "tiers": tier_stats,
         "tier_order": order.as_profile(),
+        "warnings": list(warnings),
         "unresolved": counts["domain_unresolved"],
         "next_tier": next_tier,
         "deferred_stopped_before": deferred_tier or None,

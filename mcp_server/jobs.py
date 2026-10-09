@@ -187,7 +187,7 @@ def _stall_watch(job_id: str, cancel: threading.Event) -> None:
         # Also require that we are inside a tier that should be making requests.
         phase = (job.result or {}).get("phase")
         tier = (job.result or {}).get("tier") or ""
-        if phase == "tier" and tier in ("maps", "serp", "aiark", "discolike", "prospeo", "leadmagic"):
+        if phase == "tier" and tier in ("maps", "serp", "aiark", "discolike", "prospeo"):
             if time.time() - last_move >= STALL_SECONDS:
                 request_cancel(
                     job_id,

@@ -10,6 +10,10 @@ def test_profiles_differ_only_in_json() -> None:
     assert g.geo_required is False
     assert g.geo_in_query is False
     assert p.explicit_tier_order[:5] == ["maps", "discolike", "prospeo", "aiark", "serp"]
+    assert "leadmagic" not in p.explicit_tier_order
+    assert "leadmagic" not in p.enabled_tiers
+    assert "leadmagic" not in g.enabled_tiers
+    assert "leadmagic" not in p.hit_rates
     assert p.tier_order_frozen is True
     assert p.industry_reject_regex
     assert g.industry_reject_regex is None

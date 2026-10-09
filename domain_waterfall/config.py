@@ -17,7 +17,6 @@ DEFAULT_SUPABASE_PROJECT = "azpapwtnrbzywlnxxecz"
 API_KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "discolike": ("DISCOLIKE_API_KEY", "DISCOLIKE_KEY"),
     "aiark": ("AI_ARK_API_KEY", "AIARK_API_KEY"),
-    "leadmagic": ("LEADMAGIC_API_KEY", "LEADMAGIC_KEY"),
     "prospeo": ("PROSPEO_API_KEY", "PROSPEO_KEY"),
     "apify": ("APIFY_TOKEN", "APIFY_API_TOKEN"),
     "rapidapi": ("RAPIDAPI_KEY", "MAPS_RAPIDAPI_KEY"),
@@ -43,7 +42,6 @@ class Settings:
     supabase_anon_key: str
     discolike_api_key: str
     ai_ark_api_key: str
-    leadmagic_api_key: str
     prospeo_api_key: str
     apify_token: str
     apify_actor: str
@@ -60,10 +58,11 @@ class Settings:
         return bool(self.supabase_url and self.supabase_key)
 
     def vendor_key(self, name: str) -> str:
+        if (name or "").strip().lower() == "leadmagic":
+            return ""
         mapping = {
             "discolike": self.discolike_api_key,
             "aiark": self.ai_ark_api_key,
-            "leadmagic": self.leadmagic_api_key,
             "prospeo": self.prospeo_api_key,
             "apify": self.apify_token,
             "serp": self.apify_token,
@@ -80,7 +79,6 @@ def load_settings() -> Settings:
         supabase_anon_key=_env("SUPABASE_ANON_KEY"),
         discolike_api_key=_first_env(*API_KEY_ALIASES["discolike"]),
         ai_ark_api_key=_first_env(*API_KEY_ALIASES["aiark"]),
-        leadmagic_api_key=_first_env(*API_KEY_ALIASES["leadmagic"]),
         prospeo_api_key=_first_env(*API_KEY_ALIASES["prospeo"]),
         apify_token=_first_env(*API_KEY_ALIASES["apify"]),
         apify_actor=_env("APIFY_GOOGLE_SEARCH_ACTOR", "apify/google-search-scraper"),
