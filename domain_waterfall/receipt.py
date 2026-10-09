@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from .gate import evaluate
 from .normalize import extract_domain, normalize_name
-from .pricing import compute_order, estimate_rows
+from .pricing import collect_legacy_tier_warnings, compute_order, estimate_rows
 from .profiles import get_profile, update_profile_fields
 from .source import fetch_source_rows, parse_source, where_to_filters
 from .waterfall import _run_tier, live_prices
@@ -84,6 +84,15 @@ def receipt_test(
         measured_hit_rates=profile.hit_rates,
         dropped=profile.dropped_tiers,
         explicit_order=profile.explicit_tier_order,
+    )
+    warnings = list(
+        dict.fromkeys(
+            collect_legacy_tier_warnings(
+                profile.enabled_tiers,
+                profile.explicit_tier_order,
+            )
+            + list(order.warnings)
+        )
     )
     estimate = estimate_rows(len(sample), order)
     estimate["live_units"] = {k: order.prices[k].unit for k in order.tiers}
@@ -230,6 +239,7 @@ def receipt_test(
         "dropped_tiers": dropped,
         "hit_rates": hit_rates,
         "tier_order": new_order.as_profile(),
+        "warnings": list(dict.fromkeys(warnings + list(new_order.warnings))),
     }
 
 

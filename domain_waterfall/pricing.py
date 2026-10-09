@@ -39,20 +39,74 @@ PUBLISHED: dict[str, dict[str, Any]] = {
         "free": False,
         "free_on_miss": True,
     },
-    "leadmagic": {
-        "unit": 0.015,
-        "unit_low": 0.0104,
-        "unit_high": 0.0245,
-        "credits": 1,
-        "always_billed": True,
-        "free": False,
-        "free_on_miss": False,
-    },
 }
 
 CANDIDATE_TIERS = ("texas_comptroller",)
 OUT_BY_DESIGN = ("fullenrich", "hunter", "llm", "pdl")
-DEFAULT_PIPELINE = ("cache", "maps", "aiark", "discolike", "serp", "prospeo", "leadmagic")
+# Josh dropped LeadMagic company-search on 2026-10-08. No replacement.
+REMOVED_TIERS = frozenset({"leadmagic"})
+LEGACY_REMOVED_WARNING = (
+    "legacy 'leadmagic' in a profile or request tier_order is a no-op "
+    "(Josh dropped LeadMagic company-search on 2026-10-08; no replacement)"
+)
+DEFAULT_PIPELINE = ("cache", "maps", "aiark", "discolike", "serp", "prospeo")
+
+
+def is_removed_tier(name: str) -> bool:
+    return (name or "").strip().lower() in REMOVED_TIERS
+
+
+def iter_tier_names(raw: Any) -> list[str]:
+    """Flatten strings, CSV, JSON lists, or {tier: ...} objects into names."""
+    if raw is None or raw is False:
+        return []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            import json
+
+            try:
+                return iter_tier_names(json.loads(text))
+            except ValueError:
+                pass
+        return [p.strip() for p in text.split(",") if p.strip()]
+    if isinstance(raw, dict):
+        tier = raw.get("tier")
+        return [str(tier).strip()] if tier else []
+    if isinstance(raw, (list, tuple, set)):
+        out: list[str] = []
+        for item in raw:
+            out.extend(iter_tier_names(item))
+        return out
+    text = str(raw).strip()
+    return [text] if text else []
+
+
+def strip_removed_tiers(names: Any) -> tuple[list[str], bool]:
+    """Drop removed tiers. Returns (kept, saw_legacy). Does not reject the request."""
+    kept: list[str] = []
+    saw = False
+    for name in iter_tier_names(names):
+        if is_removed_tier(name):
+            saw = True
+            continue
+        kept.append(name)
+    return kept, saw
+
+
+def collect_legacy_tier_warnings(*sources: Any, **request_tiers: Any) -> list[str]:
+    """Warn when a profile or request still names a dropped tier."""
+    names: list[str] = []
+    for src in sources:
+        names.extend(iter_tier_names(src))
+    for key in ("min_tier", "max_tier", "skip_tiers", "tier_order"):
+        if key in request_tiers:
+            names.extend(iter_tier_names(request_tiers[key]))
+    if any(is_removed_tier(n) for n in names):
+        return [LEGACY_REMOVED_WARNING]
+    return []
 
 
 @dataclass
@@ -72,6 +126,7 @@ class TierPrice:
 class TierOrder:
     tiers: list[str]
     prices: dict[str, TierPrice] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
 
     def as_profile(self) -> list[dict[str, Any]]:
         out = []
@@ -121,7 +176,11 @@ def compute_order(
     skip = set(dropped or [])
     prices: dict[str, TierPrice] = {}
     names: list[str] = []
+    saw_legacy = False
     for name in enabled:
+        if is_removed_tier(name):
+            saw_legacy = True
+            continue
         if name in skip or name in OUT_BY_DESIGN:
             continue
         meta = PUBLISHED.get(name, {"unit": 0.0, "always_billed": True, "free": False})
@@ -148,12 +207,15 @@ def compute_order(
         return (p.sort_cost, -hit, n)
 
     if explicit_order:
-        ordered = [n for n in explicit_order if n in prices]
+        explicit_kept, explicit_legacy = strip_removed_tiers(explicit_order)
+        saw_legacy = saw_legacy or explicit_legacy
+        ordered = [n for n in explicit_kept if n in prices]
         ordered += [n for n in names if n not in ordered]
         names = ordered
     else:
         names.sort(key=_key)
-    return TierOrder(tiers=names, prices=prices)
+    warnings = [LEGACY_REMOVED_WARNING] if saw_legacy else []
+    return TierOrder(tiers=names, prices=prices, warnings=warnings)
 
 
 def estimate_rows(n: int, order: TierOrder, *, paid_only: bool = False) -> dict[str, Any]:

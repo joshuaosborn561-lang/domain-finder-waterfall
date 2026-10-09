@@ -112,7 +112,6 @@ PETERSON_ROOF = {
         "aiark",
         "serp",
         "cache",
-        "leadmagic",
     ],
     "tier_order": [
         "maps",
@@ -121,7 +120,6 @@ PETERSON_ROOF = {
         "aiark",
         "serp",
         "cache",
-        "leadmagic",
     ],
     "hit_rates": {
         "maps": 0.84,
@@ -130,7 +128,6 @@ PETERSON_ROOF = {
         "aiark": 0.0,
         "serp": 0.04,
         "cache": 0.0,
-        "leadmagic": 0.0,
     },
 }
 
@@ -175,6 +172,5 @@ GOLIATH = {
         "discolike",
         "serp",
         "prospeo",
-        "leadmagic",
     ],
 }

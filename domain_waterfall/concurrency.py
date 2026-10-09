@@ -68,7 +68,6 @@ TIER_ENV_KEYS: dict[str, str] = {
     "discolike": "DISCOLIKE_CONCURRENCY",
     "serp": "SERP_CONCURRENCY",
     "prospeo": "PROSPEO_CONCURRENCY",
-    "leadmagic": "LEADMAGIC_CONCURRENCY",
 }
 
 DEFAULT_VENDOR_LIMITS: dict[str, int] = {
@@ -78,7 +77,6 @@ DEFAULT_VENDOR_LIMITS: dict[str, int] = {
     "discolike": 2,
     "serp": 8,
     "prospeo": 6,
-    "leadmagic": 4,
     "cache": 20,
 }
 
