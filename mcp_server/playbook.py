@@ -17,7 +17,8 @@ Writeback columns only: wf_domain, wf_domain_source, wf_domain_confidence, wf_do
 wf_domain_candidates, wf_phone, wf_domain_status.
 Never touch dl_status, sg_exclude, or skip_*.
 
-Tiers: cache → maps → aiark → discolike → serp → prospeo.
+Tiers: cache → maps → aiark → discolike → serp (Serper Google Search) → prospeo.
+serp is not Apify. It POSTs batches of up to 100 queries to google.serper.dev.
 LeadMagic company-search was dropped on 2026-10-08 with no replacement.
 Legacy 'leadmagic' in a profile or request tier_order is a no-op with a warning.
 """

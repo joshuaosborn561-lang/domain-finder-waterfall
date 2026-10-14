@@ -25,7 +25,7 @@ PUBLISHED: dict[str, dict[str, Any]] = {
         "free_on_miss": False,
     },
     "serp": {
-        "unit": 0.0045,
+        "unit": 0.001,
         "always_billed": True,
         "free": False,
         "free_on_miss": False,

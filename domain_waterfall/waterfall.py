@@ -175,6 +175,8 @@ def hydrate_keys() -> dict[str, bool]:
         "ai_ark": "AI_ARK_API_KEY",
         "prospeo": "PROSPEO_API_KEY",
         "apify": "APIFY_TOKEN",
+        "serper": "SERPER_API_KEY",
+        "serp": "SERPER_API_KEY",
         "rapidapi": "RAPIDAPI_KEY",
     }
     for name, env_name in env_map.items():
@@ -195,7 +197,7 @@ def hydrate_keys() -> dict[str, bool]:
         "discolike": bool(cfg.discolike_api_key),
         "aiark": bool(cfg.ai_ark_api_key),
         "prospeo": bool(cfg.prospeo_api_key),
-        "serp": bool(cfg.apify_token),
+        "serp": bool(cfg.serper_api_key),
         "maps": bool(cfg.rapidapi_key),
     }
 
@@ -262,7 +264,7 @@ def _run_tier(
         return serp.resolve_rows(
             rows,
             with_location=True,
-            unit=units.get("serp", 0.0045),
+            unit=units.get("serp", 0.001),
             on_progress=on_progress,
             deadline=deadline,
             should_stop=should_stop,
@@ -457,6 +459,48 @@ def resolve_domain(
 
     def stopped() -> bool:
         return bool(should_stop and should_stop())
+
+    def flush_writeback(keys: list[str], *, phase: str = "writeback") -> None:
+        if not writeback or not keys:
+            return
+        for batch_i, batch in enumerate(chunked(keys, WRITEBACK_CHUNK), start=1):
+            if stopped() and phase != "writeback_flush":
+                break
+            for key in batch:
+                st = states[key]
+                fields = {
+                    "wf_domain": st.get("domain"),
+                    "wf_domain_source": st.get("source"),
+                    "wf_domain_confidence": st.get("confidence") or None,
+                    "wf_domain_agreement": bool(st.get("agreement")),
+                    "wf_domain_candidates": st.get("candidates") or None,
+                    "wf_phone": st.get("phone") or None,
+                    "wf_domain_status": st["status"],
+                }
+                if st["status"] == "review" and st.get("candidates"):
+                    fields["wf_domain"] = None
+                if (st.get("confidence") or 0) < 0.5 and st["status"] not in (
+                    "review",
+                    "deferred",
+                    "domain_unresolved",
+                ):
+                    continue
+                # Keyed by row id, never positional. Never touch skip_* columns.
+                patch_source_row(src, key, fields)
+                if st.get("domain") and st["status"] == "resolved":
+                    cache.remember(
+                        str(st.get("company_name") or ""),
+                        str(st["domain"]),
+                        str(st.get("source") or ""),
+                        profile.client_tag,
+                    )
+            emit(
+                {
+                    "phase": phase,
+                    "processed": min(batch_i * WRITEBACK_CHUNK, len(keys)),
+                    "targets": len(keys),
+                }
+            )
 
     def emit(extra: dict[str, Any] | None = None) -> None:
         if not progress:
@@ -667,6 +711,14 @@ def resolve_domain(
                 "errored": result.errored,
             }
         )
+        flush_writeback(
+            [
+                str(row["_source_key"])
+                for row in targets
+                if states[str(row["_source_key"])]["status"] not in (None, "")
+            ],
+            phase="writeback",
+        )
         if stopped():
             cancelled = True
             break
@@ -679,48 +731,6 @@ def resolve_domain(
         "agreement": 0,
         "at_or_above_0_7": 0,
     }
-
-    def flush_writeback(keys: list[str], *, phase: str = "writeback") -> None:
-        if not writeback or not keys:
-            return
-        for batch_i, batch in enumerate(chunked(keys, WRITEBACK_CHUNK), start=1):
-            if stopped() and phase != "writeback_flush":
-                break
-            for key in batch:
-                st = states[key]
-                fields = {
-                    "wf_domain": st.get("domain"),
-                    "wf_domain_source": st.get("source"),
-                    "wf_domain_confidence": st.get("confidence") or None,
-                    "wf_domain_agreement": bool(st.get("agreement")),
-                    "wf_domain_candidates": st.get("candidates") or None,
-                    "wf_phone": st.get("phone") or None,
-                    "wf_domain_status": st["status"],
-                }
-                if st["status"] == "review" and st.get("candidates"):
-                    fields["wf_domain"] = None
-                if (st.get("confidence") or 0) < 0.5 and st["status"] not in (
-                    "review",
-                    "deferred",
-                    "domain_unresolved",
-                ):
-                    continue
-                # Keyed by row id, never positional. Never touch skip_* columns.
-                patch_source_row(src, key, fields)
-                if st.get("domain") and st["status"] == "resolved":
-                    cache.remember(
-                        str(st.get("company_name") or ""),
-                        str(st["domain"]),
-                        str(st.get("source") or ""),
-                        profile.client_tag,
-                    )
-            emit(
-                {
-                    "phase": phase,
-                    "processed": min(batch_i * WRITEBACK_CHUNK, len(keys)),
-                    "targets": len(keys),
-                }
-            )
 
     pending_keys: list[str] = []
     for key, st in states.items():

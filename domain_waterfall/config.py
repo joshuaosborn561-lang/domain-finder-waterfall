@@ -19,6 +19,7 @@ API_KEY_ALIASES: dict[str, tuple[str, ...]] = {
     "aiark": ("AI_ARK_API_KEY", "AIARK_API_KEY"),
     "prospeo": ("PROSPEO_API_KEY", "PROSPEO_KEY"),
     "apify": ("APIFY_TOKEN", "APIFY_API_TOKEN"),
+    "serper": ("SERPER_API_KEY",),
     "rapidapi": ("RAPIDAPI_KEY", "MAPS_RAPIDAPI_KEY"),
 }
 
@@ -44,7 +45,7 @@ class Settings:
     ai_ark_api_key: str
     prospeo_api_key: str
     apify_token: str
-    apify_actor: str
+    serper_api_key: str
     rapidapi_key: str
     maps_host: str
     extra_keys: dict[str, str]
@@ -65,7 +66,8 @@ class Settings:
             "aiark": self.ai_ark_api_key,
             "prospeo": self.prospeo_api_key,
             "apify": self.apify_token,
-            "serp": self.apify_token,
+            "serp": self.serper_api_key,
+            "serper": self.serper_api_key,
             "rapidapi": self.rapidapi_key,
             "maps": self.rapidapi_key,
         }
@@ -81,7 +83,7 @@ def load_settings() -> Settings:
         ai_ark_api_key=_first_env(*API_KEY_ALIASES["aiark"]),
         prospeo_api_key=_first_env(*API_KEY_ALIASES["prospeo"]),
         apify_token=_first_env(*API_KEY_ALIASES["apify"]),
-        apify_actor=_env("APIFY_GOOGLE_SEARCH_ACTOR", "apify/google-search-scraper"),
+        serper_api_key=_first_env(*API_KEY_ALIASES["serper"]),
         rapidapi_key=_first_env(*API_KEY_ALIASES["rapidapi"]),
         maps_host=_env("MAPS_DATA_HOST", "maps-data.p.rapidapi.com"),
         extra_keys={},

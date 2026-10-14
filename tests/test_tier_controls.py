@@ -2,9 +2,10 @@ from typing import Any
 
 import pytest
 
+from domain_waterfall.concurrency import VendorThrottle
 from domain_waterfall.profiles import ClientProfile
 from domain_waterfall.source import FetchResult
-from domain_waterfall.vendors.base import TierResult
+from domain_waterfall.vendors.base import DomainCandidate, TierResult
 from domain_waterfall.waterfall import (
     apply_tier_filters,
     parse_skip_tiers,
@@ -201,3 +202,89 @@ def test_in_tier_progress_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     assert last["rows_attempted"] == 1
     assert last["rows_done"] == 1
     assert last["requests_made"] == 2
+
+
+def test_writeback_flushes_per_tier_before_later_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from domain_waterfall import waterfall as wf
+
+    profile = ClientProfile(
+        client_tag="t",
+        raw={
+            "enabled_tiers": ["cache", "prospeo"],
+            "tier_order": ["cache", "prospeo"],
+            "geo": {"geo_required": False},
+        },
+    )
+    monkeypatch.setattr(wf, "get_profile", lambda _tag: profile)
+    monkeypatch.setattr(wf, "hydrate_keys", lambda: {"prospeo": True})
+    monkeypatch.setattr(
+        wf,
+        "live_prices",
+        lambda: (
+            {
+                "cache": 0.0,
+                "maps": 0.0,
+                "aiark": 0.0005,
+                "discolike": 0.00425,
+                "serp": 0.001,
+                "prospeo": 0.015,
+            },
+            {},
+        ),
+    )
+    fetched = FetchResult(
+        rows=[
+            {
+                "_source_key": "1",
+                "company_name": "Acme",
+                "city": "Austin",
+                "phone": "",
+            }
+        ],
+        rows_matched=1,
+        rows_fetched=1,
+        rows_excluded=0,
+        exclusion_reasons={},
+    )
+    monkeypatch.setattr(wf, "fetch_source_rows", lambda _src: fetched)
+    monkeypatch.setattr(wf, "count_source_rows", lambda _src: fetched.rows_matched)
+    monkeypatch.setattr(wf, "ensure_writeback", lambda _src: None)
+    monkeypatch.setattr(wf, "defer_unfetched", lambda *_a, **_k: 0)
+    monkeypatch.setattr(wf.cache, "remember", lambda *_a, **_k: None)
+
+    patches: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_patch(_src: object, key: str, fields: dict[str, Any]) -> None:
+        patches.append((key, dict(fields)))
+
+    monkeypatch.setattr(wf, "patch_source_row", fake_patch)
+
+    def fake_run(name: str, rows: list[dict[str, Any]], *_a: Any, **_k: Any) -> TierResult:
+        if name == "cache":
+            return TierResult(
+                tier="cache",
+                candidates={"1": DomainCandidate(domain="acme.com", vendor_name="Acme")},
+                rows_done=len(rows),
+            )
+        if name == "prospeo":
+            raise VendorThrottle("prospeo", "http 429")
+        return TierResult(tier=name, none=len(rows), rows_done=len(rows))
+
+    monkeypatch.setattr(wf, "_run_tier", fake_run)
+
+    with pytest.raises(VendorThrottle, match="http 429"):
+        resolve_domain(
+            source_table="public.t",
+            where="domain is null",
+            client_tag="t",
+            writeback=True,
+        )
+
+    assert patches, "cache hit must be written before the later tier fails"
+    key, fields = patches[0]
+    assert key == "1"
+    assert fields["wf_domain"] == "acme.com"
+    assert fields["wf_domain_source"] == "cache"
+    assert fields["wf_domain_status"] == "resolved"

@@ -27,6 +27,8 @@ Cheapest first. Free tiers, then paid tiers sorted by **live** unit price at job
 
 `cache` → `maps` → `aiark` → `discolike` → `serp` → `prospeo`
 
+`serp` is Serper Google Search (`https://google.serper.dev/search`), billed at `$0.001` per query unless `SERPER_UNIT_USD` is set. It is not Apify.
+
 Josh dropped LeadMagic company-search on 2026-10-08. There is no replacement. Legacy `leadmagic` in a stored profile or a request `tier_order` / `max_tier` / `min_tier` / `skip_tiers` is accepted as a no-op with a warning. SQL to strip it from `public.wf_client_profiles` is in `supabase/migrations/005_strip_leadmagic_from_profiles.sql` (operator-run only; this service does not apply it).
 
 A receipt run drops a tier from the profile when it returned zero correct hits, and writes `hit_rates` + `tier_order`.
