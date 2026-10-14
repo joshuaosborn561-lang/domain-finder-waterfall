@@ -31,6 +31,9 @@ PER_TIER_ENV: dict[str, str] = {
     "maps": "MAPS_TIER_CONCURRENCY",
     "serp": "SERP_TIER_CONCURRENCY",
 }
+PER_TIER_DEFAULT: dict[str, int] = {
+    "serp": 4,
+}
 
 def _env_int(name: str, default: int) -> int:
     raw = (os.environ.get(name) or "").strip()
@@ -55,7 +58,8 @@ def resolve_tier_concurrency(tier: str, override: int | None = None) -> int:
         val = _env_int(per, 0)
         if val > 0:
             return max(1, min(TIER_CONCURRENCY_CAP, val))
-    return max(1, min(TIER_CONCURRENCY_CAP, _env_int("TIER_CONCURRENCY", TIER_CONCURRENCY_DEFAULT)))
+    fallback = PER_TIER_DEFAULT.get(tier, TIER_CONCURRENCY_DEFAULT)
+    return max(1, min(TIER_CONCURRENCY_CAP, _env_int("TIER_CONCURRENCY", fallback)))
 
 
 @dataclass

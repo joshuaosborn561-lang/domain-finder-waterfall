@@ -18,6 +18,7 @@ wf_domain_candidates, wf_phone, wf_domain_status.
 Never touch dl_status, sg_exclude, or skip_*.
 
 Tiers: cache → maps → aiark → discolike → serp → prospeo.
+serp is Serper Google search (google.serper.dev), not Apify.
 LeadMagic company-search was dropped on 2026-10-08 with no replacement.
 Legacy 'leadmagic' in a profile or request tier_order is a no-op with a warning.
 """
