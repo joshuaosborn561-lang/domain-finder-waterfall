@@ -11,8 +11,8 @@ from typing import Any, Callable
 
 from domain_waterfall import http_client
 from domain_waterfall.config import settings
-from domain_waterfall.gate import GLOBAL_BLOCKLIST, is_blocklisted
-from domain_waterfall.normalize import distinctive_tokens, domain_name_part, extract_domain
+from domain_waterfall.gate import ProfileGate, evaluate, is_blocklisted
+from domain_waterfall.normalize import extract_domain
 from domain_waterfall.concurrency import (
     VendorCallTimeout,
     VendorThrottle,
@@ -205,24 +205,66 @@ def build_serp_query(name: str, city: str = "", state: str = "") -> str:
     return " ".join(p for p in ((name or "").strip(), (city or "").strip(), (state or "").strip()) if p)
 
 
-def _domain_from_organic(item: dict[str, Any], company_name: str = "") -> tuple[str, str]:
+SERP_GATE_TOP_N = 5
+
+
+def _profile_gate(profile: Any) -> ProfileGate:
+    if isinstance(profile, ProfileGate):
+        return profile
+    if profile is not None and hasattr(profile, "gate"):
+        try:
+            return profile.gate()
+        except Exception:
+            pass
+    return ProfileGate()
+
+
+def _domain_from_organic(
+    item: dict[str, Any],
+    company_name: str = "",
+    *,
+    profile: Any = None,
+    city: str = "",
+    input_state: str = "",
+    max_results: int = SERP_GATE_TOP_N,
+) -> tuple[str, str, list[dict[str, Any]]]:
+    """Walk organic hits in order. Gate each non-blocklisted result; try the next on reject."""
     organic = item.get("organicResults") or item.get("organic") or []
     if not isinstance(organic, list):
-        return "", ""
-    toks = distinctive_tokens(company_name, [])
+        return "", "", []
+    gate = _profile_gate(profile)
+    rejected: list[dict[str, Any]] = []
+    considered = 0
     for hit in organic:
         if not isinstance(hit, dict):
             continue
         url = str(hit.get("url") or hit.get("link") or "")
         domain = extract_domain(url)
-        if not domain or is_blocklisted(domain, GLOBAL_BLOCKLIST):
+        if not domain or is_blocklisted(domain, gate.blocklist):
             continue
         title = str(hit.get("title") or "")
-        part = domain_name_part(domain)
-        if toks and not any(tok in part for tok in toks):
-            continue
-        return domain, title
-    return "", ""
+        considered += 1
+        if considered > max_results:
+            break
+        result = evaluate(
+            gate,
+            input_name=company_name,
+            domain=domain,
+            title=title,
+            city=city,
+            input_state=input_state,
+        )
+        if result.accepted:
+            return domain, title, rejected
+        rejected.append(
+            {
+                "domain": result.domain or domain,
+                "tier": "serp",
+                "title": title,
+                "reason": result.reason,
+            }
+        )
+    return "", "", rejected
 
 
 def _pack_items(
@@ -230,6 +272,7 @@ def _pack_items(
     items: list[dict[str, Any]],
     *,
     unit: float,
+    profile: Any = None,
 ) -> list[dict[str, Any]]:
     by_query: dict[str, dict[str, Any]] = {}
     for item in items:
@@ -245,22 +288,32 @@ def _pack_items(
             item = items[i]
         else:
             item = _item_for_query(by_query, q["q"])
-        domain, title = (
-            _domain_from_organic(item, company_name=q.get("name") or "")
+        domain, title, rejected = (
+            _domain_from_organic(
+                item,
+                company_name=q.get("name") or "",
+                profile=profile,
+                city=q.get("city") or "",
+                input_state=q.get("state") or "",
+            )
             if isinstance(item, dict)
-            else ("", "")
+            else ("", "", [])
         )
         if not domain:
-            packed.append({"key": q["key"], "none": True})
+            row: dict[str, Any] = {"key": q["key"], "none": True}
+            if rejected:
+                row["rejected"] = rejected
+            packed.append(row)
             continue
-        packed.append(
-            {
-                "key": q["key"],
-                "domain": domain,
-                "title": title,
-                "cost_usd": unit,
-            }
-        )
+        packed_row: dict[str, Any] = {
+            "key": q["key"],
+            "domain": domain,
+            "title": title,
+            "cost_usd": unit,
+        }
+        if rejected:
+            packed_row["rejected"] = rejected
+        packed.append(packed_row)
     return packed
 
 
@@ -269,6 +322,7 @@ def _resolve_chunk(
     *,
     unit: float,
     inputs: list[str],
+    profile: Any = None,
 ) -> RowWorkResult:
     """One Serper chunk. chunk_row holds queries under _queries and a synthetic key."""
     queries: list[dict[str, str]] = list(chunk_row.get("_queries") or [])
@@ -276,7 +330,7 @@ def _resolve_chunk(
     if not queries:
         return RowWorkResult(key=key, none=True, requests=0)
     items = _search_batch(queries)
-    packed = _pack_items(queries, items, unit=unit)
+    packed = _pack_items(queries, items, unit=unit, profile=profile)
     none_n = sum(1 for p in packed if p.get("none"))
     hits_n = len(packed) - none_n
     cost = unit * len(queries)
@@ -310,6 +364,7 @@ def resolve_rows(
     deadline: float | None = None,
     should_stop: StopFn | None = None,
     concurrency: int | None = None,
+    profile: Any = None,
 ) -> TierResult:
     # Location is always on the SERP query when the row has it. geo_in_query does not apply.
     inputs = ["company_name", "city", "state"]
@@ -328,7 +383,15 @@ def resolve_rows(
         city = str(row.get("city") or "").strip()
         state = str(row.get("state") or "").strip()
         q = build_serp_query(name, city, state)
-        queries.append({"key": str(row.get("_source_key")), "q": q, "name": name})
+        queries.append(
+            {
+                "key": str(row.get("_source_key")),
+                "q": q,
+                "name": name,
+                "city": city,
+                "state": state,
+            }
+        )
 
     chunks = chunked(queries, SERP_CHUNK)
     chunk_rows: list[dict[str, Any]] = [
@@ -340,7 +403,7 @@ def resolve_rows(
         workers = resolve_tier_concurrency("serp", concurrency)
 
     def _one(chunk_row: dict[str, Any]) -> RowWorkResult:
-        return _resolve_chunk(chunk_row, unit=unit, inputs=inputs)
+        return _resolve_chunk(chunk_row, unit=unit, inputs=inputs, profile=profile)
 
     report_progress(
         on_progress,
@@ -390,6 +453,9 @@ def resolve_rows(
             if not key or key in seen_keys:
                 continue
             seen_keys.add(key)
+            rejected = item.get("rejected") or []
+            if isinstance(rejected, list) and rejected:
+                final.rejected[key] = [r for r in rejected if isinstance(r, dict)]
             if item.get("none"):
                 final.none += 1
                 done_rows += 1
