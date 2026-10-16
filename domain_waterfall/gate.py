@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from .normalize import (
+    US_STATE_ABBR,
     area_code,
     distinctive_tokens,
     domain_name_part,
@@ -120,127 +121,6 @@ TRADE_WORDS = frozenset(
     }
 )
 
-_US_STATE_ABBR = frozenset(
-    {
-        "al",
-        "ak",
-        "az",
-        "ar",
-        "ca",
-        "co",
-        "ct",
-        "de",
-        "dc",
-        "fl",
-        "ga",
-        "hi",
-        "id",
-        "il",
-        "in",
-        "ia",
-        "ks",
-        "ky",
-        "la",
-        "me",
-        "md",
-        "ma",
-        "mi",
-        "mn",
-        "ms",
-        "mo",
-        "mt",
-        "ne",
-        "nv",
-        "nh",
-        "nj",
-        "nm",
-        "ny",
-        "nc",
-        "nd",
-        "oh",
-        "ok",
-        "or",
-        "pa",
-        "ri",
-        "sc",
-        "sd",
-        "tn",
-        "tx",
-        "ut",
-        "vt",
-        "va",
-        "wa",
-        "wv",
-        "wi",
-        "wy",
-    }
-)
-
-# Full names → USPS so a Maps listing "Texas" matches a row state "TX".
-_US_STATE_NAMES = {
-    "alabama": "al",
-    "alaska": "ak",
-    "arizona": "az",
-    "arkansas": "ar",
-    "california": "ca",
-    "colorado": "co",
-    "connecticut": "ct",
-    "delaware": "de",
-    "district of columbia": "dc",
-    "florida": "fl",
-    "georgia": "ga",
-    "hawaii": "hi",
-    "idaho": "id",
-    "illinois": "il",
-    "indiana": "in",
-    "iowa": "ia",
-    "kansas": "ks",
-    "kentucky": "ky",
-    "louisiana": "la",
-    "maine": "me",
-    "maryland": "md",
-    "massachusetts": "ma",
-    "michigan": "mi",
-    "minnesota": "mn",
-    "mississippi": "ms",
-    "missouri": "mo",
-    "montana": "mt",
-    "nebraska": "ne",
-    "nevada": "nv",
-    "new hampshire": "nh",
-    "new jersey": "nj",
-    "new mexico": "nm",
-    "new york": "ny",
-    "north carolina": "nc",
-    "north dakota": "nd",
-    "ohio": "oh",
-    "oklahoma": "ok",
-    "oregon": "or",
-    "pennsylvania": "pa",
-    "rhode island": "ri",
-    "south carolina": "sc",
-    "south dakota": "sd",
-    "tennessee": "tn",
-    "texas": "tx",
-    "utah": "ut",
-    "vermont": "vt",
-    "virginia": "va",
-    "washington": "wa",
-    "west virginia": "wv",
-    "wisconsin": "wi",
-    "wyoming": "wy",
-}
-
-
-def _state_key(value: str) -> str:
-    raw = normalize_state(value)
-    if not raw:
-        return ""
-    if raw in _US_STATE_ABBR:
-        return raw
-    return _US_STATE_NAMES.get(raw, raw)
-
-
 @dataclass
 class GateResult:
     accepted: bool
@@ -336,7 +216,7 @@ def _state_from_title(title: str) -> str:
     found = [
         tok.lower()
         for tok in re.findall(r"\b[A-Z]{2}\b", title or "")
-        if tok.lower() in _US_STATE_ABBR
+        if tok.lower() in US_STATE_ABBR
     ]
     return found[-1] if found else ""
 
@@ -374,8 +254,8 @@ def listing_location(
     phone equals the row phone (digits normalized). Area-code-only does not
     override a state mismatch.
     """
-    row_st = _state_key(input_state)
-    list_st = _state_key(address_state)
+    row_st = normalize_state(input_state)
+    list_st = normalize_state(address_state)
     state_match = bool(row_st and list_st and row_st == list_st)
     state_disagree = bool(row_st and list_st and row_st != list_st)
 

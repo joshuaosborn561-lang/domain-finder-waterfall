@@ -317,6 +317,96 @@ def test_maps_listing_different_business_token() -> None:
     assert not out.listing_review
 
 
+def test_gate_florida_vs_fl_match() -> None:
+    gate = _contractor(["FL"])
+    out = evaluate(
+        gate,
+        input_name="Acme Widgets",
+        domain="acmewidgets.com",
+        vendor_name="Acme Widgets",
+        address_state="Florida",
+        input_state="FL",
+    )
+    assert out.accepted
+    assert out.reason == "ok"
+    assert out.geo_ok
+
+
+def test_gate_new_york_vs_ny_match() -> None:
+    gate = _contractor(["NY"])
+    out = evaluate(
+        gate,
+        input_name="Acme Widgets",
+        domain="acmewidgets.com",
+        vendor_name="Acme Widgets",
+        address_state="New York",
+        input_state="NY",
+    )
+    assert out.accepted
+    assert out.reason == "ok"
+    assert out.geo_ok
+
+
+def test_gate_florida_vs_tx_mismatch() -> None:
+    gate = _contractor(["TX"])
+    out = evaluate(
+        gate,
+        input_name="Acme Widgets",
+        domain="acmewidgets.com",
+        vendor_name="Acme Widgets",
+        address_state="Florida",
+        input_state="TX",
+    )
+    assert not out.accepted
+    assert out.reason == "geo_state"
+
+
+def test_maps_listing_florida_vs_fl_match() -> None:
+    gate = _contractor(["FL"])
+    out = evaluate(
+        gate,
+        input_name="Prather & Harlan Heating & Air",
+        domain="ph-ac.com",
+        vendor_name="Prather & Harlan Heating & Air",
+        address_state="Florida",
+        input_state="FL",
+        source="maps",
+    )
+    assert out.accepted
+    assert out.accepted_by_listing
+    assert out.status == "resolved"
+
+
+def test_maps_listing_new_york_vs_ny_match() -> None:
+    gate = _contractor(["NY"])
+    out = evaluate(
+        gate,
+        input_name="Prather & Harlan Heating & Air",
+        domain="ph-ac.com",
+        vendor_name="Prather & Harlan Heating & Air",
+        address_state="New York",
+        input_state="NY",
+        source="maps",
+    )
+    assert out.accepted
+    assert out.accepted_by_listing
+
+
+def test_maps_listing_florida_vs_tx_mismatch() -> None:
+    gate = _contractor(["TX"])
+    out = evaluate(
+        gate,
+        input_name="Prather & Harlan Heating & Air",
+        domain="ph-ac.com",
+        vendor_name="Prather & Harlan Heating & Air",
+        address_state="Florida",
+        input_state="TX",
+        source="maps",
+    )
+    assert not out.accepted
+    assert out.reason == "geo_state"
+
+
 def test_maps_listing_state_mismatch_geo_state() -> None:
     gate = _contractor(["TX"])
     out = evaluate(

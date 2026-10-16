@@ -25,6 +25,10 @@ def test_profiles_differ_only_in_json() -> None:
     assert ".build" not in g.tld_allow
     assert p.cache_tables == ["gc.companies"]
     assert g.cache_tables == ["public.goliath_wf_companies"]
+    assert p.discolike_min_confidence == 60
+    assert p.discolike_strict is False
+    assert g.discolike_min_confidence == 60
+    assert g.discolike_strict is False
 
 
 def test_deep_merge_keeps_people_keys() -> None:

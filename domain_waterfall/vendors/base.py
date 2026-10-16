@@ -64,3 +64,5 @@ class TierResult:
     billing: str = ""
     # Gate rejects collected inside a vendor (e.g. SERP top-N walk), keyed by row.
     rejected: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    # Rows that should be retried (timeout / vendor failure), not domain_unresolved.
+    deferred_keys: list[str] = field(default_factory=list)
