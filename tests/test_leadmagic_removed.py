@@ -79,6 +79,8 @@ def _stub_legacy_profile(monkeypatch: pytest.MonkeyPatch, ran: list[str]) -> Non
     monkeypatch.setattr(wf, "count_source_rows", lambda _src: fetched.rows_matched)
     monkeypatch.setattr(wf, "ensure_writeback", lambda _src: None)
     monkeypatch.setattr(wf, "patch_source_row", lambda *_a, **_k: None)
+    monkeypatch.setattr(wf, "patch_source_rows", lambda *_a, **_k: [])
+    monkeypatch.setattr(wf, "preflight_write_columns", lambda *_a, **_k: None)
     monkeypatch.setattr(wf, "defer_unfetched", lambda *_a, **_k: 0)
 
     def fake_run(name: str, rows: list[dict[str, Any]], *_a: Any, **_k: Any) -> TierResult:

@@ -73,10 +73,16 @@ def tld_of(domain: str) -> str:
     return "." + host.rsplit(".", 1)[-1]
 
 
-def area_code(phone: str) -> str:
+def phone_digits(phone: str) -> str:
+    """US digits only. Strips a leading country-code 1 from an 11-digit number."""
     digits = re.sub(r"\D", "", phone or "")
     if digits.startswith("1") and len(digits) == 11:
         digits = digits[1:]
+    return digits
+
+
+def area_code(phone: str) -> str:
+    digits = phone_digits(phone)
     if len(digits) >= 10:
         return digits[:3]
     return ""

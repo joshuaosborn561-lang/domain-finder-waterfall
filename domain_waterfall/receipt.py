@@ -143,6 +143,8 @@ def receipt_test(
             )
             hits = wrong = none = 0
             accepted_by_title = 0
+            accepted_by_listing = 0
+            listing_review = 0
             rejected_by_gate: dict[str, int] = {}
             for row in sample:
                 key = str(row["_source_key"])
@@ -164,6 +166,8 @@ def receipt_test(
                     address_state=cand.address_state or "",
                     city=str(row.get("city") or cand.address_city or ""),
                     input_state=str(row.get("state") or ""),
+                    source=tier_name,
+                    input_phone=str(row.get("phone") or ""),
                 )
                 if not gate.accepted:
                     if gate.reason:
@@ -171,6 +175,10 @@ def receipt_test(
                     continue
                 if gate.accepted_by_title:
                     accepted_by_title += 1
+                if gate.accepted_by_listing:
+                    accepted_by_listing += 1
+                if gate.listing_review:
+                    listing_review += 1
                 if _match(str(row.get("_truth_domain") or ""), gate.domain):
                     hits += 1
                     guessed[key] = gate.domain
@@ -184,6 +192,8 @@ def receipt_test(
                     "wrong": wrong,
                     "none": none,
                     "accepted_by_title": accepted_by_title,
+                    "accepted_by_listing": accepted_by_listing,
+                    "listing_review": listing_review,
                     "rejected_by_gate": dict(rejected_by_gate),
                     "hit_rate": round(rate, 4),
                     "cost_usd": round(result.cost_usd, 6),
@@ -206,6 +216,8 @@ def receipt_test(
                         "wrong": wrong,
                         "none": none,
                         "accepted_by_title": accepted_by_title,
+                        "accepted_by_listing": accepted_by_listing,
+                        "listing_review": listing_review,
                         "rejected_by_gate": dict(rejected_by_gate),
                     }
                 )
@@ -244,6 +256,12 @@ def receipt_test(
     def _sum_title(rows: list[dict[str, Any]]) -> int:
         return sum(int(r.get("accepted_by_title") or 0) for r in rows)
 
+    def _sum_listing(rows: list[dict[str, Any]]) -> int:
+        return sum(int(r.get("accepted_by_listing") or 0) for r in rows)
+
+    def _sum_listing_review(rows: list[dict[str, Any]]) -> int:
+        return sum(int(r.get("listing_review") or 0) for r in rows)
+
     def _sum_reasons(rows: list[dict[str, Any]]) -> dict[str, int]:
         out: dict[str, int] = {}
         for row in rows:
@@ -268,6 +286,8 @@ def receipt_test(
         "with_location": with_geo,
         "without_location": without_geo,
         "accepted_by_title": _sum_title(with_geo),
+        "accepted_by_listing": _sum_listing(with_geo),
+        "listing_review": _sum_listing_review(with_geo),
         "rejected_by_gate": _sum_reasons(with_geo),
         "dropped_tiers": dropped,
         "hit_rates": hit_rates,

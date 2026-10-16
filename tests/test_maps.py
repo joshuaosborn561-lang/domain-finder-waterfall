@@ -146,6 +146,48 @@ def test_maps_skips_details_when_search_has_website(monkeypatch: pytest.MonkeyPa
     assert all("place.php" not in u for u in urls)
 
 
+def test_maps_query_includes_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    from urllib.parse import parse_qs, urlparse
+
+    monkeypatch.setattr(maps.settings, "rapidapi_key", "fake")
+    monkeypatch.setattr(maps.settings, "maps_host", "maps-data.p.rapidapi.com")
+    urls: list[str] = []
+
+    def fake_get(_tier: str, url: str, **_k: object) -> MagicMock:
+        urls.append(url)
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [
+            {
+                "name": "Acme",
+                "website": "https://acme.com",
+                "place_id": "Chxx",
+                "state": "TX",
+            }
+        ]
+        return resp
+
+    monkeypatch.setattr(maps.http_client, "get", fake_get)
+    result = maps.resolve_rows(
+        [
+            {
+                "_source_key": "1",
+                "company_name": "Acme",
+                "city": "Austin",
+                "state": "TX",
+            }
+        ],
+        concurrency=1,
+    )
+    assert result.inputs_passed == ["company_name", "city", "state"]
+    assert "1" in result.candidates
+    assert result.candidates["1"].address_state == "TX"
+    parsed = parse_qs(urlparse(urls[0]).query)
+    query = parsed.get("query", [""])[0]
+    assert "Austin" in query
+    assert "TX" in query
+
+
 def test_maps_deadline_stops(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(maps.settings, "rapidapi_key", "fake")
     monkeypatch.setattr(maps.settings, "maps_host", "maps-data.p.rapidapi.com")

@@ -25,7 +25,7 @@ TIER_CONCURRENCY_CAP = 32
 # RapidAPI host. Concurrency 8 matches serial within 2pp and is the shipped default.
 TIER_CONCURRENCY_DEFAULT = 8
 ROW_ERROR_RETRIES = 3
-WRITEBACK_CHUNK = 200
+WRITEBACK_CHUNK = 500
 
 PER_TIER_ENV: dict[str, str] = {
     "maps": "MAPS_TIER_CONCURRENCY",

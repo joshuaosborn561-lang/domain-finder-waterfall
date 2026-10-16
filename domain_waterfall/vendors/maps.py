@@ -5,6 +5,7 @@ Maps is free on this plan (RapidAPI quota, unit_usd 0). cost_usd and credits sta
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Callable
 from urllib.parse import urlencode
@@ -202,14 +203,40 @@ def _pick_phone(row: dict[str, Any]) -> str:
     return ""
 
 
+def _pick_state(row: dict[str, Any], fallback: str = "") -> str:
+    from domain_waterfall.gate import _US_STATE_ABBR
+
+    for key in ("state", "address_state", "region"):
+        val = row.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    addr = row.get("address") or row.get("full_address") or row.get("formatted_address")
+    if isinstance(addr, dict):
+        for key in ("state", "address_state", "region"):
+            val = addr.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        addr = addr.get("address") or addr.get("full") or ""
+    if isinstance(addr, str) and addr.strip():
+        found = [
+            tok
+            for tok in re.findall(r"\b[A-Z]{2}\b", addr)
+            if tok.lower() in _US_STATE_ABBR
+        ]
+        if found:
+            return found[-1]
+    return fallback
+
+
 def resolve_one_row(row: dict[str, Any], *, with_location: bool, inputs: list[str]) -> RowWorkResult:
     """Single row resolution. Matching and gate stay unchanged upstream."""
     key = str(row.get("_source_key"))
     name = str(row.get("company_name") or "").strip()
     city = str(row.get("city") or "").strip() if with_location else ""
+    state = str(row.get("state") or "").strip() if with_location else ""
     if not name:
         return RowWorkResult(key=key, none=True, requests=0)
-    query = f"{name} {city}".strip()
+    query = " ".join(p for p in (name, city, state) if p)
     requests = 0
     hits = _search(query)
     requests += 1
@@ -232,7 +259,7 @@ def resolve_one_row(row: dict[str, Any], *, with_location: bool, inputs: list[st
         vendor_name=str(merged.get("name") or merged.get("title") or ""),
         title=str(merged.get("main_category") or merged.get("category") or ""),
         phone=_pick_phone(merged),
-        address_state=str(merged.get("state") or merged.get("address_state") or ""),
+        address_state=_pick_state(merged),
         address_city=str(merged.get("city") or city),
         place_id=place_id,
         raw={"maps_score_ignored": True},
@@ -253,7 +280,7 @@ def resolve_rows(
     should_stop: StopFn | None = None,
     concurrency: int | None = None,
 ) -> TierResult:
-    inputs = ["company_name", "city"] if with_location else ["company_name"]
+    inputs = ["company_name", "city", "state"] if with_location else ["company_name"]
     result = TierResult(
         tier="maps",
         inputs_passed=inputs,

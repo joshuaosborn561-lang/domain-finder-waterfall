@@ -29,11 +29,14 @@ from .source import (
     ensure_writeback,
     fetch_source_rows,
     parse_source,
+    WritebackResult,
     patch_source_row,
+    patch_source_rows,
+    preflight_write_columns,
 )
 
 log = logging.getLogger("domain_waterfall")
-from .tier_pool import WRITEBACK_CHUNK, chunked, resolve_tier_concurrency
+from .tier_pool import WRITEBACK_CHUNK, resolve_tier_concurrency
 from .vendors import aiark, cache, discolike, maps, prospeo, serp
 from .vendors.base import DomainCandidate, OnProgress, TierResult
 
@@ -148,6 +151,8 @@ def make_row_ticker(
 FREE_ALWAYS = frozenset({"cache", "maps"})
 FREE_ON_MISS = frozenset({"prospeo"})
 PAID = frozenset({"aiark", "discolike", "serp"})
+# Maps is free but long-running. Preflight types before the first of these.
+PREFLIGHT_TIERS = frozenset({"maps", "aiark", "discolike", "serp", "prospeo"})
 
 
 def load_private_keys() -> dict[str, str]:
@@ -458,7 +463,12 @@ def resolve_domain(
     tier_stats: list[dict[str, Any]] = []
     guessed: dict[str, str] = {}
     accepted_by_title_total = 0
+    accepted_by_listing_total = 0
+    listing_review_total = 0
     rejected_by_reason_total: dict[str, int] = {}
+    preflight_done = False
+    failed_writeback_items: list[tuple[Any, dict[str, Any]]] = []
+    failed_writeback_rows = 0
 
     def stopped() -> bool:
         return bool(should_stop and should_stop())
@@ -477,6 +487,10 @@ def resolve_domain(
                 "tier": payload.get("tier") or "",
                 "title": payload.get("title") or "",
                 "reason": reason,
+                "vendor_name": payload.get("vendor_name") or "",
+                "address_city": payload.get("address_city") or "",
+                "address_state": payload.get("address_state") or "",
+                "phone": payload.get("phone") or "",
             }
         )
 
@@ -495,6 +509,9 @@ def resolve_domain(
             "deferred": sum(1 for s in states.values() if s["status"] == "deferred"),
             "unresolved": sum(1 for s in states.values() if s["status"] in (None, "domain_unresolved")),
             "accepted_by_title": accepted_by_title_total,
+            "accepted_by_listing": accepted_by_listing_total,
+            "listing_review": listing_review_total,
+            "failed_writeback_rows": failed_writeback_rows,
             "rejected_by_gate": dict(rejected_by_reason_total),
             "tiers": tier_stats,
             "last_progress_at": utc_now_iso(),
@@ -510,47 +527,104 @@ def resolve_domain(
 
     emit({"phase": "start", "estimate_usd": estimate["estimated_usd"]})
 
+    def _remember_written(written_keys: list[Any]) -> None:
+        for raw in written_keys:
+            st = states.get(str(raw))
+            if not st:
+                continue
+            if st.get("domain") and st["status"] == "resolved":
+                cache.remember(
+                    str(st.get("company_name") or ""),
+                    str(st["domain"]),
+                    str(st.get("source") or ""),
+                    profile.client_tag,
+                )
+
     def flush_writeback(keys: list[str], *, phase: str = "writeback") -> None:
         if not writeback or not keys:
             return
-        for batch_i, batch in enumerate(chunked(keys, WRITEBACK_CHUNK), start=1):
+        items: list[tuple[Any, dict[str, Any]]] = []
+        for key in keys:
             if stopped() and phase != "writeback_flush":
                 break
-            for key in batch:
-                st = states[key]
-                fields = {
-                    "wf_domain": st.get("domain"),
-                    "wf_domain_source": st.get("source"),
-                    "wf_domain_confidence": st.get("confidence") or None,
-                    "wf_domain_agreement": bool(st.get("agreement")),
-                    "wf_domain_candidates": st.get("candidates") or None,
-                    "wf_phone": st.get("phone") or None,
-                    "wf_domain_status": st["status"],
-                }
-                if st["status"] == "review" and st.get("candidates"):
-                    fields["wf_domain"] = None
-                if (st.get("confidence") or 0) < 0.5 and st["status"] not in (
-                    "review",
-                    "deferred",
-                    "domain_unresolved",
-                ):
-                    continue
-                # Keyed by row id, never positional. Never touch skip_* columns.
-                patch_source_row(src, key, fields)
-                if st.get("domain") and st["status"] == "resolved":
-                    cache.remember(
-                        str(st.get("company_name") or ""),
-                        str(st["domain"]),
-                        str(st.get("source") or ""),
-                        profile.client_tag,
-                    )
-            emit(
-                {
-                    "phase": phase,
-                    "processed": min(batch_i * WRITEBACK_CHUNK, len(keys)),
-                    "targets": len(keys),
-                }
+            st = states[key]
+            fields = {
+                "wf_domain": st.get("domain"),
+                "wf_domain_source": st.get("source"),
+                "wf_domain_confidence": st.get("confidence") or None,
+                "wf_domain_agreement": bool(st.get("agreement")),
+                "wf_domain_candidates": st.get("candidates") or None,
+                "wf_phone": st.get("phone") or None,
+                "wf_domain_status": st["status"],
+            }
+            if st["status"] == "review" and st.get("candidates"):
+                fields["wf_domain"] = None
+            if (st.get("confidence") or 0) < 0.5 and st["status"] not in (
+                "review",
+                "deferred",
+                "domain_unresolved",
+            ):
+                continue
+            # Keyed by row id, never positional. Never touch skip_* columns.
+            items.append((key, fields))
+        if not items:
+            return
+        result = patch_source_rows(src, items)
+        if not isinstance(result, WritebackResult):
+            keys_written = list(result or [])
+            result = WritebackResult(written_keys=keys_written)
+        written = list(result.written_keys)
+        if result.failed_items:
+            log.warning(
+                "writeback failed after retries, rows=%s, queued for end-of-tier retry",
+                len(result.failed_items),
             )
+            failed_writeback_items.extend(result.failed_items)
+        _remember_written(written)
+        emit(
+            {
+                "phase": phase,
+                "processed": len(written),
+                "targets": len(keys),
+                "failed_writeback_rows": failed_writeback_rows + len(failed_writeback_items),
+            }
+        )
+
+    def retry_failed_writeback(*, phase: str = "writeback_retry") -> None:
+        nonlocal failed_writeback_rows
+        if not writeback or not failed_writeback_items:
+            failed_writeback_rows = len({str(k) for k, _ in failed_writeback_items})
+            return
+        pending = list(failed_writeback_items)
+        failed_writeback_items.clear()
+        result = patch_source_rows(src, pending)
+        if not isinstance(result, WritebackResult):
+            result = WritebackResult(written_keys=list(result or []))
+        _remember_written(result.written_keys)
+        if result.failed_items:
+            log.error(
+                "writeback end-of-tier retry failed, rows=%s",
+                len(result.failed_items),
+            )
+            failed_writeback_items.extend(result.failed_items)
+        failed_writeback_rows = len({str(k) for k, _ in failed_writeback_items})
+        emit(
+            {
+                "phase": phase,
+                "processed": len(result.written_keys),
+                "targets": len(pending),
+                "failed_writeback_rows": failed_writeback_rows,
+            }
+        )
+
+    def flush_pending(pending_keys: list[str], *, phase: str = "writeback") -> None:
+        """Flush every 500 newly settled rows during a tier, not only at the end."""
+        if len(pending_keys) < WRITEBACK_CHUNK and phase != "writeback_flush":
+            return
+        if not pending_keys:
+            return
+        flush_writeback(list(pending_keys), phase=phase)
+        pending_keys.clear()
 
     def flush_settled(*, phase: str = "writeback") -> None:
         keys = [key for key, st in states.items() if st["status"] not in (None, "")]
@@ -584,6 +658,10 @@ def resolve_domain(
         if not targets:
             continue
 
+        if writeback and not preflight_done and tier_name in PREFLIGHT_TIERS:
+            preflight_write_columns(src)
+            preflight_done = True
+
         projected = spent + (price.unit * len(targets) if is_paid else 0.0)
         if is_paid and approve_cost_usd is not None and projected > approve_cost_usd:
             deferred_tier = tier_name
@@ -593,6 +671,7 @@ def resolve_domain(
                     states[key]["status"] = "deferred"
             emit({"phase": "cost_gate", "stopped_before": tier_name, "would_cost_usd": round(projected, 4)})
             flush_settled()
+            retry_failed_writeback()
             break
 
         budget_s = tier_budget_seconds(len(targets))
@@ -638,6 +717,8 @@ def resolve_domain(
         accepted = 0
         rejected = 0
         accepted_by_title = 0
+        accepted_by_listing = 0
+        listing_review = 0
         rejected_reasons: dict[str, int] = {}
         for row in targets:
             key = str(row["_source_key"])
@@ -656,6 +737,10 @@ def resolve_domain(
                             "tier": prior.get("tier") or tier_name,
                             "title": prior.get("title") or "",
                             "reason": reason,
+                            "vendor_name": prior.get("vendor_name") or "",
+                            "address_city": prior.get("address_city") or "",
+                            "address_state": prior.get("address_state") or "",
+                            "phone": prior.get("phone") or "",
                         },
                     )
             if not cand or not cand.domain:
@@ -670,6 +755,8 @@ def resolve_domain(
                 address_state=cand.address_state or "",
                 city=str(row.get("city") or cand.address_city or ""),
                 input_state=str(row.get("state") or ""),
+                source=tier_name,
+                input_phone=str(row.get("phone") or ""),
             )
             if not gate.accepted:
                 rejected += 1
@@ -682,6 +769,10 @@ def resolve_domain(
                         "tier": tier_name,
                         "title": cand.title,
                         "reason": gate.reason,
+                        "vendor_name": cand.vendor_name,
+                        "address_city": cand.address_city,
+                        "address_state": cand.address_state,
+                        "phone": cand.phone,
                     },
                 )
                 continue
@@ -689,6 +780,12 @@ def resolve_domain(
             if gate.accepted_by_title:
                 accepted_by_title += 1
                 accepted_by_title_total += 1
+            if gate.accepted_by_listing:
+                accepted_by_listing += 1
+                accepted_by_listing_total += 1
+            if gate.listing_review:
+                listing_review += 1
+                listing_review_total += 1
             accepted_rows.append(
                 {
                     "key": key,
@@ -703,6 +800,7 @@ def resolve_domain(
         sinks = sink_map(
             [{"domain": a["domain"], "company_name": a["company_name"]} for a in accepted_rows]
         )
+        pending_flush: list[str] = []
         for item in accepted_rows:
             if item["domain"] in sinks:
                 rejected += 1
@@ -735,6 +833,10 @@ def resolve_domain(
                 st["source"] = tier_name
                 st["confidence"] = gate.confidence
                 st["status"] = gate.status
+            pending_flush.append(key)
+            flush_pending(pending_flush)
+
+        flush_pending(pending_flush, phase="writeback_flush")
 
         tier_stats.append(
             {
@@ -742,6 +844,8 @@ def resolve_domain(
                 "targets": len(targets),
                 "accepted": accepted,
                 "accepted_by_title": accepted_by_title,
+                "accepted_by_listing": accepted_by_listing,
+                "listing_review": listing_review,
                 "rejected_by_gate": rejected,
                 "rejected_by_gate_reasons": dict(rejected_reasons),
                 "none": result.none,
@@ -777,6 +881,7 @@ def resolve_domain(
         )
         # Persist this tier now so a later vendor crash does not lose it.
         flush_settled()
+        retry_failed_writeback()
         if stopped():
             cancelled = True
             break
@@ -789,6 +894,9 @@ def resolve_domain(
         "agreement": 0,
         "at_or_above_0_7": 0,
         "accepted_by_title": accepted_by_title_total,
+        "accepted_by_listing": accepted_by_listing_total,
+        "listing_review": listing_review_total,
+        "failed_writeback_rows": failed_writeback_rows,
         "rejected_by_gate": dict(rejected_by_reason_total),
     }
 
@@ -804,6 +912,8 @@ def resolve_domain(
         pending_keys.append(key)
 
     flush_writeback(pending_keys, phase="writeback_flush" if cancelled else "writeback")
+    retry_failed_writeback(phase="writeback_retry_final")
+    counts["failed_writeback_rows"] = failed_writeback_rows
 
     next_tier = deferred_tier or ""
     if not next_tier:
@@ -822,6 +932,9 @@ def resolve_domain(
         "approve_cost_usd": approve_cost_usd,
         "counts": counts,
         "accepted_by_title": accepted_by_title_total,
+        "accepted_by_listing": accepted_by_listing_total,
+        "listing_review": listing_review_total,
+        "failed_writeback_rows": failed_writeback_rows,
         "rejected_by_gate": dict(rejected_by_reason_total),
         "agreement_rate": round(counts["agreement"] / n, 4) if n else 0.0,
         "tiers": tier_stats,
