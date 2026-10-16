@@ -74,6 +74,8 @@ def _stub_resolve(monkeypatch: pytest.MonkeyPatch, ran: list[str]) -> None:
     monkeypatch.setattr(wf, "count_source_rows", lambda _src: fetched.rows_matched)
     monkeypatch.setattr(wf, "ensure_writeback", lambda _src: None)
     monkeypatch.setattr(wf, "patch_source_row", lambda *_a, **_k: None)
+    monkeypatch.setattr(wf, "patch_source_rows", lambda *_a, **_k: [])
+    monkeypatch.setattr(wf, "preflight_write_columns", lambda *_a, **_k: None)
     monkeypatch.setattr(wf, "defer_unfetched", lambda *_a, **_k: 0)
 
     def fake_run(name: str, rows: list[dict[str, Any]], *_a: Any, **_k: Any) -> TierResult:
@@ -240,14 +242,17 @@ def test_writeback_flushes_after_each_tier(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(wf, "count_source_rows", lambda _src: fetched.rows_matched)
     monkeypatch.setattr(wf, "ensure_writeback", lambda _src: None)
     monkeypatch.setattr(wf, "defer_unfetched", lambda *_a, **_k: 0)
+    monkeypatch.setattr(wf, "preflight_write_columns", lambda *_a, **_k: None)
     monkeypatch.setattr(cache_mod, "remember", lambda *_a, **_k: None)
 
     patches: list[tuple[str, dict[str, Any]]] = []
 
-    def capture_patch(_src: Any, key: str, fields: dict[str, Any]) -> None:
-        patches.append((key, dict(fields)))
+    def capture_rows(_src: Any, items: list, **_k: Any) -> list:
+        for key, fields in items:
+            patches.append((key, dict(fields)))
+        return [key for key, _ in items]
 
-    monkeypatch.setattr(wf, "patch_source_row", capture_patch)
+    monkeypatch.setattr(wf, "patch_source_rows", capture_rows)
 
     def fake_run(name: str, rows: list[dict[str, Any]], *_a: Any, **_k: Any) -> TierResult:
         if name == "prospeo":
@@ -309,13 +314,16 @@ def test_unresolved_keeps_gate_rejected_candidates(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(wf, "count_source_rows", lambda _src: fetched.rows_matched)
     monkeypatch.setattr(wf, "ensure_writeback", lambda _src: None)
     monkeypatch.setattr(wf, "defer_unfetched", lambda *_a, **_k: 0)
+    monkeypatch.setattr(wf, "preflight_write_columns", lambda *_a, **_k: None)
 
     patches: list[tuple[str, dict[str, Any]]] = []
 
-    def capture_patch(_src: Any, key: str, fields: dict[str, Any]) -> None:
-        patches.append((key, dict(fields)))
+    def capture_rows(_src: Any, items: list, **_k: Any) -> list:
+        for key, fields in items:
+            patches.append((key, dict(fields)))
+        return [key for key, _ in items]
 
-    monkeypatch.setattr(wf, "patch_source_row", capture_patch)
+    monkeypatch.setattr(wf, "patch_source_rows", capture_rows)
 
     def fake_run(name: str, rows: list[dict[str, Any]], *_a: Any, **_k: Any) -> TierResult:
         return TierResult(
@@ -343,6 +351,10 @@ def test_unresolved_keeps_gate_rejected_candidates(monkeypatch: pytest.MonkeyPat
     assert cands[0]["reason"] == "blocklist"
     assert cands[0]["tier"] == "cache"
     assert "title" in cands[0]
+    assert "vendor_name" in cands[0]
+    assert "address_city" in cands[0]
+    assert "address_state" in cands[0]
+    assert "phone" in cands[0]
     banned = {"dl_status", "sg_exclude"}
     assert banned.isdisjoint(last)
     assert all(not k.startswith("skip_") for k in last)

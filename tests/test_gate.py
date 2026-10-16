@@ -280,6 +280,77 @@ def test_initials_plus_title_geo_ok_resolves() -> None:
     assert out.confidence == 0.8
 
 
+def test_maps_listing_match_resolves() -> None:
+    gate = _contractor(["TX"])
+    out = evaluate(
+        gate,
+        input_name="Prather & Harlan Heating & Air",
+        domain="ph-ac.com",
+        vendor_name="Prather & Harlan Heating & Air",
+        address_state="TX",
+        input_state="TX",
+        source="maps",
+    )
+    assert out.accepted
+    assert out.accepted_by_listing
+    assert not out.accepted_by_title
+    assert not out.token_hit
+    assert out.status == "resolved"
+    assert out.confidence == 0.85
+
+
+def test_maps_listing_different_business_token() -> None:
+    gate = _contractor(["TX"])
+    out = evaluate(
+        gate,
+        input_name="Prather & Harlan Heating & Air",
+        domain="ph-ac.com",
+        vendor_name="Acme Plumbing Dallas",
+        address_state="TX",
+        input_state="TX",
+        source="maps",
+    )
+    assert not out.accepted
+    assert out.reason == "token"
+    assert not out.accepted_by_listing
+
+
+def test_maps_listing_state_mismatch_geo_state() -> None:
+    gate = _contractor(["TX"])
+    out = evaluate(
+        gate,
+        input_name="Prather & Harlan Heating & Air",
+        domain="ph-ac.com",
+        vendor_name="Prather & Harlan Heating & Air",
+        address_state="FL",
+        input_state="TX",
+        source="maps",
+    )
+    assert not out.accepted
+    assert out.reason == "geo_state"
+    assert not out.accepted_by_listing
+
+
+def test_serp_no_domain_token_unchanged() -> None:
+    gate = _contractor(["TX"])
+    out = evaluate(
+        gate,
+        input_name="Prather & Harlan",
+        domain="ph-ac.com",
+        title="Prather & Harlan Heating and Air",
+        input_state="TX",
+        source="serp",
+    )
+    assert out.accepted
+    assert out.accepted_by_title
+    assert not out.accepted_by_listing
+    assert out.initials_match
+    assert out.title_match
+    assert not out.token_hit
+    assert out.status == "review"
+    assert out.confidence == 0.6
+
+
 def test_sinks() -> None:
     sinks = find_sinks(
         {

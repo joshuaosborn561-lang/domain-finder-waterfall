@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,6 +16,16 @@ from .normalize import normalize_name
 log = logging.getLogger("domain_waterfall.source")
 
 PAGE_SIZE = 500
+WRITEBACK_BATCH = 500
+WRITEBACK_CONCURRENCY_DEFAULT = 4
+WRITEBACK_CONCURRENCY_CAP = 8
+PREFLIGHT_TYPES = {
+    "wf_domain_agreement": frozenset({"boolean", "bool"}),
+    "wf_domain_confidence": frozenset(
+        {"numeric", "decimal", "real", "double precision", "float8", "float4"}
+    ),
+    "wf_domain_candidates": frozenset({"jsonb", "json"}),
+}
 INPUT_FIELDS = (
     "company_name",
     "city",
@@ -470,3 +482,190 @@ def patch_source_row(src: TableSource, key: Any, fields: dict[str, Any]) -> None
             "p_fields": allowed,
         },
     )
+
+
+class PartialWriteError(RuntimeError):
+    """Some writeback batches saved; later batches failed."""
+
+    def __init__(self, message: str, written_keys: list[Any] | None = None) -> None:
+        super().__init__(message)
+        self.written_keys = list(written_keys or [])
+
+
+def resolve_writeback_concurrency(override: int | None = None) -> int:
+    if override is not None:
+        try:
+            n = int(override)
+        except (TypeError, ValueError):
+            n = WRITEBACK_CONCURRENCY_DEFAULT
+        return max(1, min(WRITEBACK_CONCURRENCY_CAP, n))
+    raw = (os.environ.get("WRITEBACK_CONCURRENCY") or "").strip()
+    if not raw:
+        return WRITEBACK_CONCURRENCY_DEFAULT
+    try:
+        n = int(raw)
+    except ValueError:
+        n = WRITEBACK_CONCURRENCY_DEFAULT
+    return max(1, min(WRITEBACK_CONCURRENCY_CAP, n))
+
+
+def _is_missing_rpc(exc: BaseException, name: str = "") -> bool:
+    text = str(exc).lower()
+    fn = (name or "").lower()
+    if "pgrst202" in text:
+        return True
+    if "could not find the function" in text and (not fn or fn in text):
+        return True
+    if fn and fn in text and ("404" in text or "does not exist" in text):
+        return True
+    return False
+
+
+def _batch_payload(
+    src: TableSource, items: list[tuple[Any, dict[str, Any]]]
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for key, fields in items:
+        if key in (None, ""):
+            continue
+        allowed = sb.filter_write_fields(fields)
+        if not allowed:
+            continue
+        rows.append({src.key_column: str(key), **allowed})
+    return rows
+
+
+def _write_one_batch(
+    src: TableSource,
+    items: list[tuple[Any, dict[str, Any]]],
+    *,
+    batch_available: list[bool],
+) -> list[Any]:
+    """Write one <=500-row batch. Falls back to per-row if the batch RPC is missing."""
+    payload = _batch_payload(src, items)
+    if not payload:
+        return []
+    keys = [row[src.key_column] for row in payload]
+    if batch_available and batch_available[0] is False:
+        for key, fields in items:
+            patch_source_row(src, key, fields)
+        return keys
+    try:
+        sb.rpc(
+            "dw_patch_source_batch",
+            {
+                "p_table": src.qualified,
+                "p_key_column": src.key_column,
+                "p_rows": payload,
+            },
+        )
+        if batch_available:
+            batch_available[0] = True
+        return keys
+    except RuntimeError as exc:
+        if _is_missing_rpc(exc, "dw_patch_source_batch"):
+            if batch_available:
+                batch_available[0] = False
+            log.warning("dw_patch_source_batch missing, falling back to per-row RPC")
+            for key, fields in items:
+                patch_source_row(src, key, fields)
+            return keys
+        raise
+
+
+def patch_source_rows(
+    src: TableSource,
+    items: list[tuple[Any, dict[str, Any]]],
+    *,
+    concurrency: int | None = None,
+) -> list[Any]:
+    """Write settled rows in 500-row batches through a small worker pool.
+
+    A failure in a later batch leaves earlier successful batches saved.
+    Returns keys that were written. Raises PartialWriteError on a mixed result.
+    """
+    usable = [(key, fields) for key, fields in items if key not in (None, "")]
+    if not usable:
+        return []
+    batches = [
+        usable[i : i + WRITEBACK_BATCH] for i in range(0, len(usable), WRITEBACK_BATCH)
+    ]
+    workers = min(resolve_writeback_concurrency(concurrency), len(batches))
+    written: list[Any] = []
+    errors: list[BaseException] = []
+    batch_available: list[bool] = [True]
+
+    def _run(batch: list[tuple[Any, dict[str, Any]]]) -> list[Any]:
+        return _write_one_batch(src, batch, batch_available=batch_available)
+
+    if workers <= 1:
+        for batch in batches:
+            try:
+                written.extend(_run(batch))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [pool.submit(_run, batch) for batch in batches]
+            for fut in as_completed(futs):
+                try:
+                    written.extend(fut.result())
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+    if errors:
+        raise PartialWriteError(str(errors[0]), written_keys=written) from errors[0]
+    return written
+
+
+def _coerce_types(data: Any) -> dict[str, str]:
+    if isinstance(data, dict):
+        nested = data.get("dw_source_column_types") or data.get("types") or data
+        if nested is not data and isinstance(nested, dict):
+            data = nested
+        if all(not isinstance(v, dict) for v in data.values()):
+            return {str(k): str(v).lower() for k, v in data.items() if k}
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        first = data[0]
+        nested = first.get("dw_source_column_types") or first.get("types")
+        if isinstance(nested, dict):
+            return {str(k): str(v).lower() for k, v in nested.items() if k}
+        if "column_name" in first or "column" in first:
+            out: dict[str, str] = {}
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                name = row.get("column_name") or row.get("column")
+                typ = row.get("data_type") or row.get("udt_name") or row.get("type")
+                if name and typ:
+                    out[str(name)] = str(typ).lower()
+            return out
+    return {}
+
+
+def fetch_column_types(src: TableSource) -> dict[str, str]:
+    try:
+        data = sb.rpc(
+            "dw_source_column_types",
+            {"p_schema": src.schema, "p_table": src.table},
+        )
+    except RuntimeError as exc:
+        if _is_missing_rpc(exc, "dw_source_column_types"):
+            return {}
+        raise
+    return _coerce_types(data)
+
+
+def preflight_write_columns(src: TableSource) -> None:
+    """Fail fast when wf_* writeback columns have the wrong type."""
+    types = fetch_column_types(src)
+    if not types:
+        return
+    for col, allowed in PREFLIGHT_TYPES.items():
+        got = (types.get(col) or "").strip().lower()
+        if not got:
+            continue
+        if got not in allowed:
+            raise ValueError(
+                f"source column {col} has type {got!r} on {src.qualified}; "
+                f"expected {sorted(allowed)}"
+            )

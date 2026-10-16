@@ -12,6 +12,7 @@ from .normalize import (
     domain_name_part,
     extract_domain,
     normalize_state,
+    phone_digits,
     tld_of,
 )
 
@@ -175,6 +176,70 @@ _US_STATE_ABBR = frozenset(
     }
 )
 
+# Full names → USPS so a Maps listing "Texas" matches a row state "TX".
+_US_STATE_NAMES = {
+    "alabama": "al",
+    "alaska": "ak",
+    "arizona": "az",
+    "arkansas": "ar",
+    "california": "ca",
+    "colorado": "co",
+    "connecticut": "ct",
+    "delaware": "de",
+    "district of columbia": "dc",
+    "florida": "fl",
+    "georgia": "ga",
+    "hawaii": "hi",
+    "idaho": "id",
+    "illinois": "il",
+    "indiana": "in",
+    "iowa": "ia",
+    "kansas": "ks",
+    "kentucky": "ky",
+    "louisiana": "la",
+    "maine": "me",
+    "maryland": "md",
+    "massachusetts": "ma",
+    "michigan": "mi",
+    "minnesota": "mn",
+    "mississippi": "ms",
+    "missouri": "mo",
+    "montana": "mt",
+    "nebraska": "ne",
+    "nevada": "nv",
+    "new hampshire": "nh",
+    "new jersey": "nj",
+    "new mexico": "nm",
+    "new york": "ny",
+    "north carolina": "nc",
+    "north dakota": "nd",
+    "ohio": "oh",
+    "oklahoma": "ok",
+    "oregon": "or",
+    "pennsylvania": "pa",
+    "rhode island": "ri",
+    "south carolina": "sc",
+    "south dakota": "sd",
+    "tennessee": "tn",
+    "texas": "tx",
+    "utah": "ut",
+    "vermont": "vt",
+    "virginia": "va",
+    "washington": "wa",
+    "west virginia": "wv",
+    "wisconsin": "wi",
+    "wyoming": "wy",
+}
+
+
+def _state_key(value: str) -> str:
+    raw = normalize_state(value)
+    if not raw:
+        return ""
+    if raw in _US_STATE_ABBR:
+        return raw
+    return _US_STATE_NAMES.get(raw, raw)
+
 
 @dataclass
 class GateResult:
@@ -188,6 +253,7 @@ class GateResult:
     confidence: float = 0.0
     status: str = ""  # resolved | review | ""
     accepted_by_title: bool = False
+    accepted_by_listing: bool = False
     title_match: bool = False
     initials_match: bool = False
 
@@ -274,6 +340,53 @@ def _state_from_title(title: str) -> str:
     return found[-1] if found else ""
 
 
+def listing_name_match(
+    vendor_name: str,
+    tokens: list[str],
+    *,
+    city: str = "",
+    input_name: str = "",
+    strip_tokens: list[str] | None = None,
+) -> bool:
+    """Every distinctive token appears in the Maps listing name (whole word)."""
+    if not title_has_all_tokens(vendor_name, tokens):
+        return False
+    if len(tokens) == 1:
+        return _one_token_title_extra(
+            vendor_name, city, input_name, list(strip_tokens or [])
+        )
+    return True
+
+
+def listing_location(
+    *,
+    address_state: str = "",
+    input_state: str = "",
+    listing_phone: str = "",
+    input_phone: str = "",
+) -> tuple[bool, bool]:
+    """Return (has_location_signal, location_disagrees).
+
+    Signal: listing state equals row state, listing area code is one the row
+    phone uses, or the two phones match after digit normalization.
+    Disagreement: both sides have a state and they are not the same.
+    """
+    row_st = _state_key(input_state)
+    list_st = _state_key(address_state)
+    disagree = bool(row_st and list_st and row_st != list_st)
+    signal = bool(row_st and list_st and row_st == list_st)
+
+    row_digits = phone_digits(input_phone)
+    list_digits = phone_digits(listing_phone)
+    if row_digits and list_digits and row_digits == list_digits:
+        signal = True
+    row_ac = area_code(input_phone)
+    list_ac = area_code(listing_phone)
+    if row_ac and list_ac and row_ac == list_ac:
+        signal = True
+    return signal, disagree
+
+
 def _one_token_title_extra(
     title: str,
     city: str,
@@ -314,6 +427,8 @@ def evaluate(
     address_state: str = "",
     city: str = "",
     input_state: str = "",
+    source: str = "",
+    input_phone: str = "",
 ) -> GateResult:
     host = extract_domain(domain)
     if not host:
@@ -340,7 +455,19 @@ def evaluate(
         and _one_token_title_extra(title, city, input_name, profile.name_strip_tokens)
     )
     second_path = bool(tokens and not token_on_domain and (initials_match or one_token_ok))
-    if tokens and not token_on_domain and not second_path:
+    listing_path = bool(
+        tokens
+        and not token_on_domain
+        and (source or "").strip().lower() == "maps"
+        and listing_name_match(
+            vendor_name,
+            tokens,
+            city=city,
+            input_name=input_name,
+            strip_tokens=profile.name_strip_tokens,
+        )
+    )
+    if tokens and not token_on_domain and not second_path and not listing_path:
         return GateResult(
             False,
             domain=host,
@@ -356,6 +483,42 @@ def evaluate(
     allow = _compile(profile.industry_allow_regex)
     if allow and not allow.search(industry_text):
         return GateResult(False, domain=host, reason="industry_allow")
+
+    if listing_path:
+        loc_ok, loc_bad = listing_location(
+            address_state=address_state,
+            input_state=input_state,
+            listing_phone=phone,
+            input_phone=input_phone,
+        )
+        if loc_bad:
+            return GateResult(
+                False,
+                domain=host,
+                reason="geo_state",
+                title_match=title_match,
+                initials_match=initials_match,
+            )
+        if loc_ok:
+            confidence = 0.85
+            status = "resolved"
+        else:
+            confidence = 0.6
+            status = "review"
+        return GateResult(
+            accepted=True,
+            domain=host,
+            reason="ok",
+            token_hit=False,
+            token_on_vendor_name=token_on_vendor,
+            geo_ok=loc_ok,
+            geo_signal=loc_ok,
+            confidence=confidence,
+            status=status,
+            accepted_by_listing=True,
+            title_match=title_match,
+            initials_match=initials_match,
+        )
 
     if not address_state:
         address_state = _state_from_title(title)
