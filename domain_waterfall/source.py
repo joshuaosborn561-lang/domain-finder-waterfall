@@ -5,9 +5,12 @@ from __future__ import annotations
 import logging
 import os
 import re
+import ssl
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
+from urllib import error as urllib_error
 
 from . import supabase as sb
 from .config import DEFAULT_SUPABASE_PROJECT
@@ -19,6 +22,22 @@ PAGE_SIZE = 500
 WRITEBACK_BATCH = 500
 WRITEBACK_CONCURRENCY_DEFAULT = 4
 WRITEBACK_CONCURRENCY_CAP = 8
+WRITEBACK_RETRY_BACKOFF_S = (2.0, 5.0, 15.0)
+WRITEBACK_MAX_ATTEMPTS = 1 + len(WRITEBACK_RETRY_BACKOFF_S)
+_TRANSIENT_MARKERS = (
+    "sslv3_alert_handshake_failure",
+    "handshake failure",
+    "timeout",
+    "timed out",
+    "connection reset",
+    "connection aborted",
+    "broken pipe",
+    "temporarily unavailable",
+    "eof occurred",
+    "urlerror",
+    "remote end closed",
+    "remotedisconnected",
+)
 PREFLIGHT_TYPES = {
     "wf_domain_agreement": frozenset({"boolean", "bool"}),
     "wf_domain_confidence": frozenset(
@@ -468,11 +487,73 @@ def ensure_writeback(src: TableSource) -> list[str]:
     return []
 
 
+def _writeback_sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def is_transient_writeback_error(exc: BaseException) -> bool:
+    """URLError, SSL handshake, timeouts, 5xx, and connection resets."""
+    if isinstance(
+        exc,
+        (
+            TimeoutError,
+            ConnectionError,
+            ConnectionResetError,
+            BrokenPipeError,
+            urllib_error.URLError,
+            ssl.SSLError,
+        ),
+    ):
+        return True
+    if isinstance(exc, urllib_error.HTTPError):
+        try:
+            return 500 <= int(exc.code) <= 599
+        except (TypeError, ValueError):
+            return False
+    text = str(exc).lower()
+    if any(marker in text for marker in _TRANSIENT_MARKERS):
+        return True
+    if re.search(r"\(5\d{2}\)", text) or re.search(r"\bhttp\s+5\d{2}\b", text):
+        return True
+    cause = exc.__cause__
+    if cause is not None and cause is not exc:
+        return is_transient_writeback_error(cause)
+    return False
+
+
+def writeback_rpc(name: str, body: dict[str, Any] | None = None) -> Any:
+    """POST a writeback RPC. Retry transient errors up to 3 times (2s, 5s, 15s)."""
+    last: BaseException | None = None
+    for attempt in range(WRITEBACK_MAX_ATTEMPTS):
+        try:
+            return sb.rpc(name, body)
+        except Exception as exc:  # noqa: BLE001
+            if _is_missing_rpc(exc, name):
+                raise
+            if not is_transient_writeback_error(exc):
+                raise
+            last = exc
+            if attempt >= WRITEBACK_MAX_ATTEMPTS - 1:
+                break
+            delay = WRITEBACK_RETRY_BACKOFF_S[min(attempt, len(WRITEBACK_RETRY_BACKOFF_S) - 1)]
+            log.warning(
+                "writeback rpc %s attempt %s/%s failed, retry in %ss, %s",
+                name,
+                attempt + 1,
+                WRITEBACK_MAX_ATTEMPTS,
+                delay,
+                exc,
+            )
+            _writeback_sleep(delay)
+    assert last is not None
+    raise last
+
+
 def patch_source_row(src: TableSource, key: Any, fields: dict[str, Any]) -> None:
     allowed = sb.filter_write_fields(fields)
     if not allowed or key in (None, ""):
         return
-    sb.rpc(
+    writeback_rpc(
         "dw_patch_source",
         {
             "p_schema": src.schema,
@@ -484,12 +565,24 @@ def patch_source_row(src: TableSource, key: Any, fields: dict[str, Any]) -> None
     )
 
 
+@dataclass
+class WritebackResult:
+    written_keys: list[Any] = field(default_factory=list)
+    failed_items: list[tuple[Any, dict[str, Any]]] = field(default_factory=list)
+
+
 class PartialWriteError(RuntimeError):
     """Some writeback batches saved; later batches failed."""
 
-    def __init__(self, message: str, written_keys: list[Any] | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        written_keys: list[Any] | None = None,
+        failed_items: list[tuple[Any, dict[str, Any]]] | None = None,
+    ) -> None:
         super().__init__(message)
         self.written_keys = list(written_keys or [])
+        self.failed_items = list(failed_items or [])
 
 
 def resolve_writeback_concurrency(override: int | None = None) -> int:
@@ -535,23 +628,36 @@ def _batch_payload(
     return rows
 
 
+def _write_rows_individually(
+    src: TableSource, items: list[tuple[Any, dict[str, Any]]]
+) -> WritebackResult:
+    written: list[Any] = []
+    failed: list[tuple[Any, dict[str, Any]]] = []
+    for key, fields in items:
+        try:
+            patch_source_row(src, key, fields)
+            written.append(key)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("writeback per-row failed after retries, key=%s, %s", key, exc)
+            failed.append((key, fields))
+    return WritebackResult(written_keys=written, failed_items=failed)
+
+
 def _write_one_batch(
     src: TableSource,
     items: list[tuple[Any, dict[str, Any]]],
     *,
     batch_available: list[bool],
-) -> list[Any]:
+) -> WritebackResult:
     """Write one <=500-row batch. Falls back to per-row if the batch RPC is missing."""
     payload = _batch_payload(src, items)
     if not payload:
-        return []
+        return WritebackResult()
     keys = [row[src.key_column] for row in payload]
     if batch_available and batch_available[0] is False:
-        for key, fields in items:
-            patch_source_row(src, key, fields)
-        return keys
+        return _write_rows_individually(src, items)
     try:
-        sb.rpc(
+        writeback_rpc(
             "dw_patch_source_batch",
             {
                 "p_table": src.qualified,
@@ -561,16 +667,19 @@ def _write_one_batch(
         )
         if batch_available:
             batch_available[0] = True
-        return keys
-    except RuntimeError as exc:
+        return WritebackResult(written_keys=keys)
+    except Exception as exc:  # noqa: BLE001
         if _is_missing_rpc(exc, "dw_patch_source_batch"):
             if batch_available:
                 batch_available[0] = False
             log.warning("dw_patch_source_batch missing, falling back to per-row RPC")
-            for key, fields in items:
-                patch_source_row(src, key, fields)
-            return keys
-        raise
+            return _write_rows_individually(src, items)
+        log.warning(
+            "writeback batch failed after retries, rows=%s, %s",
+            len(items),
+            exc,
+        )
+        return WritebackResult(failed_items=list(items))
 
 
 def patch_source_rows(
@@ -578,43 +687,39 @@ def patch_source_rows(
     items: list[tuple[Any, dict[str, Any]]],
     *,
     concurrency: int | None = None,
-) -> list[Any]:
+) -> WritebackResult:
     """Write settled rows in 500-row batches through a small worker pool.
 
     A failure in a later batch leaves earlier successful batches saved.
-    Returns keys that were written. Raises PartialWriteError on a mixed result.
+    Failed batches are returned, not raised — the job keeps running.
     """
     usable = [(key, fields) for key, fields in items if key not in (None, "")]
     if not usable:
-        return []
+        return WritebackResult()
     batches = [
         usable[i : i + WRITEBACK_BATCH] for i in range(0, len(usable), WRITEBACK_BATCH)
     ]
     workers = min(resolve_writeback_concurrency(concurrency), len(batches))
     written: list[Any] = []
-    errors: list[BaseException] = []
+    failed: list[tuple[Any, dict[str, Any]]] = []
     batch_available: list[bool] = [True]
 
-    def _run(batch: list[tuple[Any, dict[str, Any]]]) -> list[Any]:
+    def _run(batch: list[tuple[Any, dict[str, Any]]]) -> WritebackResult:
         return _write_one_batch(src, batch, batch_available=batch_available)
 
     if workers <= 1:
         for batch in batches:
-            try:
-                written.extend(_run(batch))
-            except Exception as exc:  # noqa: BLE001
-                errors.append(exc)
+            out = _run(batch)
+            written.extend(out.written_keys)
+            failed.extend(out.failed_items)
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = [pool.submit(_run, batch) for batch in batches]
             for fut in as_completed(futs):
-                try:
-                    written.extend(fut.result())
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(exc)
-    if errors:
-        raise PartialWriteError(str(errors[0]), written_keys=written) from errors[0]
-    return written
+                out = fut.result()
+                written.extend(out.written_keys)
+                failed.extend(out.failed_items)
+    return WritebackResult(written_keys=written, failed_items=failed)
 
 
 def _coerce_types(data: Any) -> dict[str, str]:

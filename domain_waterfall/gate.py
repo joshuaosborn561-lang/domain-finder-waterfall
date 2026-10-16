@@ -254,6 +254,7 @@ class GateResult:
     status: str = ""  # resolved | review | ""
     accepted_by_title: bool = False
     accepted_by_listing: bool = False
+    listing_review: bool = False
     title_match: bool = False
     initials_match: bool = False
 
@@ -369,22 +370,25 @@ def listing_location(
 
     Signal: listing state equals row state, listing area code is one the row
     phone uses, or the two phones match after digit normalization.
-    Disagreement: both sides have a state and they are not the same.
+    Disagreement: both sides have a state and they differ, unless the listing
+    phone equals the row phone (digits normalized). Area-code-only does not
+    override a state mismatch.
     """
     row_st = _state_key(input_state)
     list_st = _state_key(address_state)
-    disagree = bool(row_st and list_st and row_st != list_st)
-    signal = bool(row_st and list_st and row_st == list_st)
+    state_match = bool(row_st and list_st and row_st == list_st)
+    state_disagree = bool(row_st and list_st and row_st != list_st)
 
     row_digits = phone_digits(input_phone)
     list_digits = phone_digits(listing_phone)
-    if row_digits and list_digits and row_digits == list_digits:
-        signal = True
+    exact_phone = bool(row_digits and list_digits and row_digits == list_digits)
     row_ac = area_code(input_phone)
     list_ac = area_code(listing_phone)
-    if row_ac and list_ac and row_ac == list_ac:
-        signal = True
-    return signal, disagree
+    ac_match = bool(row_ac and list_ac and row_ac == list_ac)
+
+    if state_disagree and not exact_phone:
+        return False, True
+    return bool(state_match or exact_phone or ac_match), False
 
 
 def _one_token_title_extra(
@@ -476,14 +480,6 @@ def evaluate(
             initials_match=initials_match,
         )
 
-    industry_text = _blob(host, vendor_name, title)
-    reject = _compile(profile.industry_reject_regex)
-    if reject and reject.search(industry_text):
-        return GateResult(False, domain=host, reason="industry_reject")
-    allow = _compile(profile.industry_allow_regex)
-    if allow and not allow.search(industry_text):
-        return GateResult(False, domain=host, reason="industry_allow")
-
     if listing_path:
         loc_ok, loc_bad = listing_location(
             address_state=address_state,
@@ -515,10 +511,19 @@ def evaluate(
             geo_signal=loc_ok,
             confidence=confidence,
             status=status,
-            accepted_by_listing=True,
+            accepted_by_listing=status == "resolved",
+            listing_review=status == "review",
             title_match=title_match,
             initials_match=initials_match,
         )
+
+    industry_text = _blob(host, vendor_name, title)
+    reject = _compile(profile.industry_reject_regex)
+    if reject and reject.search(industry_text):
+        return GateResult(False, domain=host, reason="industry_reject")
+    allow = _compile(profile.industry_allow_regex)
+    if allow and not allow.search(industry_text):
+        return GateResult(False, domain=host, reason="industry_allow")
 
     if not address_state:
         address_state = _state_from_title(title)

@@ -29,7 +29,7 @@ from .source import (
     ensure_writeback,
     fetch_source_rows,
     parse_source,
-    PartialWriteError,
+    WritebackResult,
     patch_source_row,
     patch_source_rows,
     preflight_write_columns,
@@ -464,8 +464,11 @@ def resolve_domain(
     guessed: dict[str, str] = {}
     accepted_by_title_total = 0
     accepted_by_listing_total = 0
+    listing_review_total = 0
     rejected_by_reason_total: dict[str, int] = {}
     preflight_done = False
+    failed_writeback_items: list[tuple[Any, dict[str, Any]]] = []
+    failed_writeback_rows = 0
 
     def stopped() -> bool:
         return bool(should_stop and should_stop())
@@ -507,6 +510,8 @@ def resolve_domain(
             "unresolved": sum(1 for s in states.values() if s["status"] in (None, "domain_unresolved")),
             "accepted_by_title": accepted_by_title_total,
             "accepted_by_listing": accepted_by_listing_total,
+            "listing_review": listing_review_total,
+            "failed_writeback_rows": failed_writeback_rows,
             "rejected_by_gate": dict(rejected_by_reason_total),
             "tiers": tier_stats,
             "last_progress_at": utc_now_iso(),
@@ -564,26 +569,51 @@ def resolve_domain(
             items.append((key, fields))
         if not items:
             return
-        written: list[Any] = []
-        try:
-            written = patch_source_rows(src, items)
-        except PartialWriteError as exc:
-            written = list(exc.written_keys)
-            _remember_written(written)
-            emit(
-                {
-                    "phase": phase,
-                    "processed": len(written),
-                    "targets": len(keys),
-                }
+        result = patch_source_rows(src, items)
+        if not isinstance(result, WritebackResult):
+            keys_written = list(result or [])
+            result = WritebackResult(written_keys=keys_written)
+        written = list(result.written_keys)
+        if result.failed_items:
+            log.warning(
+                "writeback failed after retries, rows=%s, queued for end-of-tier retry",
+                len(result.failed_items),
             )
-            raise
+            failed_writeback_items.extend(result.failed_items)
         _remember_written(written)
         emit(
             {
                 "phase": phase,
                 "processed": len(written),
                 "targets": len(keys),
+                "failed_writeback_rows": failed_writeback_rows + len(failed_writeback_items),
+            }
+        )
+
+    def retry_failed_writeback(*, phase: str = "writeback_retry") -> None:
+        nonlocal failed_writeback_rows
+        if not writeback or not failed_writeback_items:
+            failed_writeback_rows = len({str(k) for k, _ in failed_writeback_items})
+            return
+        pending = list(failed_writeback_items)
+        failed_writeback_items.clear()
+        result = patch_source_rows(src, pending)
+        if not isinstance(result, WritebackResult):
+            result = WritebackResult(written_keys=list(result or []))
+        _remember_written(result.written_keys)
+        if result.failed_items:
+            log.error(
+                "writeback end-of-tier retry failed, rows=%s",
+                len(result.failed_items),
+            )
+            failed_writeback_items.extend(result.failed_items)
+        failed_writeback_rows = len({str(k) for k, _ in failed_writeback_items})
+        emit(
+            {
+                "phase": phase,
+                "processed": len(result.written_keys),
+                "targets": len(pending),
+                "failed_writeback_rows": failed_writeback_rows,
             }
         )
 
@@ -641,6 +671,7 @@ def resolve_domain(
                     states[key]["status"] = "deferred"
             emit({"phase": "cost_gate", "stopped_before": tier_name, "would_cost_usd": round(projected, 4)})
             flush_settled()
+            retry_failed_writeback()
             break
 
         budget_s = tier_budget_seconds(len(targets))
@@ -687,6 +718,7 @@ def resolve_domain(
         rejected = 0
         accepted_by_title = 0
         accepted_by_listing = 0
+        listing_review = 0
         rejected_reasons: dict[str, int] = {}
         for row in targets:
             key = str(row["_source_key"])
@@ -751,6 +783,9 @@ def resolve_domain(
             if gate.accepted_by_listing:
                 accepted_by_listing += 1
                 accepted_by_listing_total += 1
+            if gate.listing_review:
+                listing_review += 1
+                listing_review_total += 1
             accepted_rows.append(
                 {
                     "key": key,
@@ -810,6 +845,7 @@ def resolve_domain(
                 "accepted": accepted,
                 "accepted_by_title": accepted_by_title,
                 "accepted_by_listing": accepted_by_listing,
+                "listing_review": listing_review,
                 "rejected_by_gate": rejected,
                 "rejected_by_gate_reasons": dict(rejected_reasons),
                 "none": result.none,
@@ -845,6 +881,7 @@ def resolve_domain(
         )
         # Persist this tier now so a later vendor crash does not lose it.
         flush_settled()
+        retry_failed_writeback()
         if stopped():
             cancelled = True
             break
@@ -858,6 +895,8 @@ def resolve_domain(
         "at_or_above_0_7": 0,
         "accepted_by_title": accepted_by_title_total,
         "accepted_by_listing": accepted_by_listing_total,
+        "listing_review": listing_review_total,
+        "failed_writeback_rows": failed_writeback_rows,
         "rejected_by_gate": dict(rejected_by_reason_total),
     }
 
@@ -873,6 +912,8 @@ def resolve_domain(
         pending_keys.append(key)
 
     flush_writeback(pending_keys, phase="writeback_flush" if cancelled else "writeback")
+    retry_failed_writeback(phase="writeback_retry_final")
+    counts["failed_writeback_rows"] = failed_writeback_rows
 
     next_tier = deferred_tier or ""
     if not next_tier:
@@ -892,6 +933,8 @@ def resolve_domain(
         "counts": counts,
         "accepted_by_title": accepted_by_title_total,
         "accepted_by_listing": accepted_by_listing_total,
+        "listing_review": listing_review_total,
+        "failed_writeback_rows": failed_writeback_rows,
         "rejected_by_gate": dict(rejected_by_reason_total),
         "agreement_rate": round(counts["agreement"] / n, 4) if n else 0.0,
         "tiers": tier_stats,
