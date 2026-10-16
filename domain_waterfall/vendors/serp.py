@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -24,7 +25,7 @@ from domain_waterfall.tier_pool import (
     resolve_tier_concurrency,
     run_row_pool,
 )
-from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
+from domain_waterfall.vendors.base import DomainCandidate, OnProgress, OnSettled, TierResult, report_progress
 
 log = logging.getLogger("domain_waterfall.serp")
 
@@ -365,6 +366,7 @@ def resolve_rows(
     should_stop: StopFn | None = None,
     concurrency: int | None = None,
     profile: Any = None,
+    on_settled: OnSettled | None = None,
 ) -> TierResult:
     # Location is always on the SERP query when the row has it. geo_in_query does not apply.
     inputs = ["company_name", "city", "state"]
@@ -417,6 +419,72 @@ def resolve_rows(
             "tier_cost_usd": 0.0,
         },
     )
+
+    # Unpack as each chunk settles so writeback can flush while later chunks run.
+    final = TierResult(
+        tier="serp",
+        inputs_passed=inputs,
+        billing=result.billing,
+        billed_calls=0,
+        cost_usd=0.0,
+        credits=0.0,
+    )
+    seen_keys: set[str] = set()
+    unpacked_chunks: set[str] = set()
+    done_rows = 0
+    unpack_lock = threading.Lock()
+
+    def _apply_packed(packed: list[Any], *, notify: bool) -> None:
+        nonlocal done_rows
+        for item in packed:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key"))
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            rejected_raw = item.get("rejected") or []
+            rejected = [r for r in rejected_raw if isinstance(r, dict)] if isinstance(rejected_raw, list) else []
+            if rejected:
+                final.rejected[key] = rejected
+            if item.get("none"):
+                final.none += 1
+                done_rows += 1
+                if notify and on_settled:
+                    on_settled(key, None, rejected=rejected or None)
+                continue
+            domain = str(item.get("domain") or "")
+            if not domain:
+                final.none += 1
+                done_rows += 1
+                if notify and on_settled:
+                    on_settled(key, None, rejected=rejected or None)
+                continue
+            cost = float(item.get("cost_usd") or unit)
+            cand = DomainCandidate(
+                domain=domain,
+                vendor_name="",
+                title=str(item.get("title") or ""),
+                inputs_passed=inputs,
+                billed=True,
+                cost_usd=cost,
+            )
+            final.candidates[key] = cand
+            final.billed_calls += 1
+            done_rows += 1
+            if notify and on_settled:
+                on_settled(key, cand, rejected=rejected or None)
+
+    def on_chunk(chunk_key: str, cand: DomainCandidate | None, *_a: Any, **_k: Any) -> None:
+        with unpack_lock:
+            if chunk_key in unpacked_chunks:
+                return
+            unpacked_chunks.add(chunk_key)
+            if cand is None:
+                return
+            final.cost_usd += cand.cost_usd
+            _apply_packed((cand.raw or {}).get("serp_chunk") or [], notify=True)
+
     pooled = run_row_pool(
         chunk_rows,
         _one,
@@ -426,60 +494,21 @@ def resolve_rows(
         should_stop=should_stop,
         deadline=deadline,
         result=result,
+        on_settled=on_chunk if on_settled else None,
     )
 
-    # Unpack chunk carriers into per row candidates.
-    final = TierResult(
-        tier="serp",
-        inputs_passed=inputs,
-        billing=result.billing,
-        skipped=pooled.skipped,
-        error=pooled.error,
-        calls=pooled.calls,
-        billed_calls=0,
-        cost_usd=0.0,
-        credits=0.0,
-        errored=pooled.errored,
-    )
-    seen_keys: set[str] = set()
-    done_rows = 0
+    final.skipped = pooled.skipped
+    final.error = pooled.error
+    final.calls = pooled.calls
+    final.errored = pooled.errored
 
-    def _apply_packed(packed: list[Any]) -> None:
-        nonlocal done_rows
-        for item in packed:
-            if not isinstance(item, dict):
+    for chunk_key, carrier in pooled.candidates.items():
+        with unpack_lock:
+            if chunk_key in unpacked_chunks:
                 continue
-            key = str(item.get("key"))
-            if not key or key in seen_keys:
-                continue
-            seen_keys.add(key)
-            rejected = item.get("rejected") or []
-            if isinstance(rejected, list) and rejected:
-                final.rejected[key] = [r for r in rejected if isinstance(r, dict)]
-            if item.get("none"):
-                final.none += 1
-                done_rows += 1
-                continue
-            domain = str(item.get("domain") or "")
-            if not domain:
-                final.none += 1
-                done_rows += 1
-                continue
-            cost = float(item.get("cost_usd") or unit)
-            final.candidates[key] = DomainCandidate(
-                domain=domain,
-                vendor_name="",
-                title=str(item.get("title") or ""),
-                inputs_passed=inputs,
-                billed=True,
-                cost_usd=cost,
-            )
-            final.billed_calls += 1
-            done_rows += 1
-
-    for carrier in pooled.candidates.values():
-        final.cost_usd += carrier.cost_usd
-        _apply_packed((carrier.raw or {}).get("serp_chunk") or [])
+            unpacked_chunks.add(chunk_key)
+            final.cost_usd += carrier.cost_usd
+            _apply_packed((carrier.raw or {}).get("serp_chunk") or [], notify=False)
 
     # Chunks that errored after retries: count leftover queries as errored, not none.
     errored_chunks = pooled.errored

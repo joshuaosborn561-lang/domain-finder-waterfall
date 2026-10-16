@@ -9,7 +9,7 @@ from domain_waterfall.source import (
     parse_source,
     where_to_filters,
 )
-from domain_waterfall.supabase import filter_write_fields
+from domain_waterfall.supabase import filter_write_fields, merge_write_fields
 
 
 def test_where_in_and_null() -> None:
@@ -124,3 +124,17 @@ def test_write_allowlist() -> None:
     )
     assert set(out) == {"wf_domain", "wf_phone"}
     assert "dl_status" not in out
+
+
+def test_merge_write_fields_partial_does_not_null_missing() -> None:
+    existing = {
+        "wf_domain": "a.com",
+        "wf_phone": "1",
+        "wf_domain_status": "resolved",
+        "dl_status": "x",
+    }
+    out = merge_write_fields(existing, {"wf_domain_status": "review", "dl_status": "nope"})
+    assert out["wf_domain"] == "a.com"
+    assert out["wf_phone"] == "1"
+    assert out["wf_domain_status"] == "review"
+    assert out["dl_status"] == "x"

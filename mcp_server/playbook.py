@@ -9,7 +9,7 @@ Tools:
 - ensure_profile / get_profile
 - receipt_test (phase zero — run this first)
 - resolve_domain(source_table, where, client_tag, max_tier, min_tier, skip_tiers, concurrency, approve_cost_usd, estimate_only)
-- get_job_status / cancel_job / list_jobs (in tier: processed / rows_done / requests_made / errored / last_progress_at)
+- get_job_status / cancel_job / list_jobs (in tier: processed / rows_done / requests_made / errored / last_progress_at / saved_rows / last_flush_at)
 
 Source is always source_table + where, paged 500. No inline rows. Responses are counts/cost only.
 

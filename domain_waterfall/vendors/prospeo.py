@@ -7,7 +7,7 @@ from typing import Any
 from domain_waterfall import http_client
 from domain_waterfall.config import settings
 from domain_waterfall.normalize import extract_domain
-from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
+from domain_waterfall.vendors.base import DomainCandidate, OnProgress, OnSettled, TierResult, report_progress
 
 BASE = "https://api.prospeo.io"
 BATCH = 25
@@ -55,6 +55,7 @@ def resolve_rows(
     guessed: dict[str, str] | None = None,
     unit: float = 0.015,
     on_progress: OnProgress | None = None,
+    on_settled: OnSettled | None = None,
 ) -> TierResult:
     result = TierResult(tier="prospeo", inputs_passed=["company_name"])
     if not settings.prospeo_api_key:
@@ -84,13 +85,20 @@ def resolve_rows(
             timeout=60,
         )
         result.calls += 1
+        chunk_keys = [str(row.get("_source_key")) for row in chunk]
         if r is None or r.status_code >= 400:
             result.none += len(chunk)
+            if on_settled:
+                for key in chunk_keys:
+                    on_settled(key, None)
             continue
         try:
             body = r.json()
         except ValueError:
             result.none += len(chunk)
+            if on_settled:
+                for key in chunk_keys:
+                    on_settled(key, None)
             continue
         matched = body.get("matched") if isinstance(body, dict) else None
         found_keys: set[str] = set()
@@ -118,6 +126,8 @@ def resolve_rows(
                     credits=1,
                     inputs_passed=result.inputs_passed,
                 )
+                if on_settled:
+                    on_settled(ident, result.candidates[ident])
         cost = body.get("total_cost") if isinstance(body, dict) else None
         try:
             credits = float(cost) if cost is not None else float(len(found_keys))
@@ -127,5 +137,9 @@ def resolve_rows(
         result.cost_usd += credits * unit
         result.billed_calls += int(credits)
         result.none += len(chunk) - len(found_keys)
+        if on_settled:
+            for key in chunk_keys:
+                if key not in found_keys:
+                    on_settled(key, None)
         report_progress(on_progress, min(i + len(chunk), len(rows)), len(rows), len(result.candidates))
     return result

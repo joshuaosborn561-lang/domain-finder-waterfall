@@ -14,7 +14,7 @@ Nothing industry-specific lives in code. Every client, vertical, and geography i
 | `get_profile(client_tag)` | Read it back |
 | `receipt_test(client_tag, n)` | Phase zero. Score each tier on ground truth, with and without location |
 | `resolve_domain(source_table, where, client_tag, max_tier, approve_cost_usd, estimate_only)` | Production run. Source table only. Counts / cost, never rows |
-| `get_job_status(job_id)` | Last known progress. Never a bare error |
+| `get_job_status(job_id)` | Last known progress (`saved_rows`, `last_flush_at`, in-tier counters). Never a bare error |
 | `list_jobs(limit)` | Recent jobs |
 
 Input rows are always read via `source_table` + `where`, paged 500 server-side.

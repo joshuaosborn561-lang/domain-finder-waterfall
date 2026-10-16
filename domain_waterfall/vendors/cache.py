@@ -6,7 +6,7 @@ from typing import Any
 
 from domain_waterfall import supabase as sb
 from domain_waterfall.normalize import extract_domain, normalize_name
-from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
+from domain_waterfall.vendors.base import DomainCandidate, OnProgress, OnSettled, TierResult, report_progress
 
 
 def lookup_cache(names: list[str], extra_tables: list[str] | None = None) -> TierResult:
@@ -67,6 +67,7 @@ def lookup_many(
     rows: list[dict[str, Any]],
     extra_tables: list[str] | None = None,
     on_progress: OnProgress | None = None,
+    on_settled: OnSettled | None = None,
 ) -> TierResult:
     # Cache key is normalized company name only. City/state are never part of the join.
     names = [str(r.get("company_name") or "") for r in rows]
@@ -88,8 +89,12 @@ def lookup_many(
         cand = by_norm.get(norm)
         if not cand:
             out.none += 1
+            if on_settled:
+                on_settled(key, None)
             continue
         out.candidates[key] = cand
+        if on_settled:
+            on_settled(key, cand)
     out.calls = keyed.calls
     report_progress(on_progress, len(rows), len(rows), len(out.candidates))
     return out
