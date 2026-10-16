@@ -8,7 +8,7 @@ from domain_waterfall import http_client
 from domain_waterfall.config import settings
 from domain_waterfall.normalize import e164_us, extract_domain
 from domain_waterfall.profiles import ClientProfile
-from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
+from domain_waterfall.vendors.base import DomainCandidate, OnProgress, OnSettled, TierResult, report_progress
 
 BASE = "https://api.ai-ark.com/api/developer-portal"
 
@@ -73,6 +73,7 @@ def resolve_rows(
     with_location: bool = True,
     unit: float = 0.0005,
     on_progress: OnProgress | None = None,
+    on_settled: OnSettled | None = None,
 ) -> TierResult:
     inputs = ["company_name"]
     if with_location:
@@ -91,6 +92,8 @@ def resolve_rows(
         if not name:
             result.none += 1
             report_progress(on_progress, idx, total, len(result.candidates))
+            if on_settled:
+                on_settled(key, None)
             continue
         account: dict[str, Any] = {
             "name": {"any": {"include": {"mode": "SMART", "content": [name]}}},
@@ -132,6 +135,8 @@ def resolve_rows(
         if not hits:
             result.none += 1
             report_progress(on_progress, idx, total, len(result.candidates))
+            if on_settled:
+                on_settled(key, None)
             continue
         top = hits[0]
         summary = top.get("summary") if isinstance(top.get("summary"), dict) else {}
@@ -142,6 +147,8 @@ def resolve_rows(
         if not domain:
             result.none += 1
             report_progress(on_progress, idx, total, len(result.candidates))
+            if on_settled:
+                on_settled(key, None)
             continue
         result.candidates[key] = DomainCandidate(
             domain=domain,
@@ -156,5 +163,7 @@ def resolve_rows(
             cost_usd=unit if hits else 0.0,
             credits=0.1 if hits else 0.0,
         )
+        if on_settled:
+            on_settled(key, result.candidates[key])
         report_progress(on_progress, idx, total, len(result.candidates))
     return result

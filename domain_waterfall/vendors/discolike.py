@@ -10,7 +10,7 @@ from typing import Any
 from domain_waterfall import http_client
 from domain_waterfall.config import settings
 from domain_waterfall.normalize import extract_domain
-from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
+from domain_waterfall.vendors.base import DomainCandidate, OnProgress, OnSettled, TierResult, report_progress
 
 BASE = "https://api.discolike.com/v1"
 UNIT = 0.00425
@@ -25,6 +25,7 @@ def resolve_rows(
     *,
     with_location: bool = True,
     on_progress: OnProgress | None = None,
+    on_settled: OnSettled | None = None,
 ) -> TierResult:
     inputs = ["company_name"]
     if with_location:
@@ -151,9 +152,16 @@ def resolve_rows(
             billed=True,
             cost_usd=UNIT,
         )
+        if on_settled:
+            on_settled(key, result.candidates[key])
     # Billed on every query, including misses.
     result.billed_calls = len(rows)
     result.cost_usd = UNIT * len(rows)
     result.none = len(rows) - len(result.candidates)
+    if on_settled:
+        for row in rows:
+            miss_key = str(row.get("_source_key") or "")
+            if miss_key and miss_key not in seen:
+                on_settled(miss_key, None)
     report_progress(on_progress, len(rows), len(rows), len(result.candidates))
     return result

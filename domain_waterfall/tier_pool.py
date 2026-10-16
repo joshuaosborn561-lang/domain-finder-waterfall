@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from domain_waterfall.concurrency import VendorThrottle, VendorTransportError
-from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
+from domain_waterfall.vendors.base import DomainCandidate, OnProgress, OnSettled, TierResult, report_progress
 
 log = logging.getLogger("domain_waterfall.tier_pool")
 
@@ -199,6 +199,7 @@ def run_row_pool(
     should_stop: StopFn | None = None,
     deadline: float | None = None,
     result: TierResult | None = None,
+    on_settled: OnSettled | None = None,
 ) -> TierResult:
     """Run resolve_one over a fixed row snapshot with bounded concurrency."""
     out = result or TierResult(tier=tier)
@@ -303,6 +304,7 @@ def run_row_pool(
                 requests=work.requests,
             )
             emit_progress(extra)
+            _notify_settled(key, work.candidate)
             return
 
         # Retries exhausted: record as errored, never silently as none.
@@ -321,6 +323,15 @@ def run_row_pool(
             requests=max(1, requests_total),
         )
         emit_progress(extra)
+        _notify_settled(key, None)
+
+    def _notify_settled(key: str, candidate: DomainCandidate | None) -> None:
+        if not on_settled:
+            return
+        try:
+            on_settled(key, candidate)
+        except Exception:  # noqa: BLE001
+            log.exception("on_settled failed, tier=%s key=%s", tier, key)
 
     out_lock = threading.Lock()
 

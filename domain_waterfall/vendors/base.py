@@ -5,6 +5,8 @@ from typing import Any, Callable
 
 # processed, total, hits[, extra]
 OnProgress = Callable[..., None]
+# key, candidate[, rejected=]
+OnSettled = Callable[..., None]
 
 
 def report_progress(

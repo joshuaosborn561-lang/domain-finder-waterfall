@@ -103,3 +103,19 @@ def filter_write_fields(fields: dict[str, Any]) -> dict[str, Any]:
             continue
         out[key] = val
     return out
+
+
+def merge_write_fields(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    """Same semantics as dw_patch_source_batch (migration 007).
+
+    Only keys present in incoming overwrite, including explicit None.
+    Absent keys keep the existing value. Never copies dl_status / sg_exclude / skip_*.
+    """
+    out = dict(existing)
+    for key, val in incoming.items():
+        if key.startswith("skip_") or key in FORBIDDEN_WRITE:
+            continue
+        if key not in WRITE_COLUMNS:
+            continue
+        out[key] = val
+    return out

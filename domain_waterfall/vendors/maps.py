@@ -24,7 +24,7 @@ from domain_waterfall.tier_pool import (
     resolve_tier_concurrency,
     run_row_pool,
 )
-from domain_waterfall.vendors.base import DomainCandidate, OnProgress, TierResult, report_progress
+from domain_waterfall.vendors.base import DomainCandidate, OnProgress, OnSettled, TierResult, report_progress
 
 MAPS_CALL_TIMEOUT_S = 15
 MAPS_MAX_ATTEMPTS = 1
@@ -279,6 +279,7 @@ def resolve_rows(
     deadline: float | None = None,
     should_stop: StopFn | None = None,
     concurrency: int | None = None,
+    on_settled: OnSettled | None = None,
 ) -> TierResult:
     inputs = ["company_name", "city", "state"] if with_location else ["company_name"]
     result = TierResult(
@@ -308,4 +309,5 @@ def resolve_rows(
         should_stop=should_stop,
         deadline=deadline,
         result=result,
+        on_settled=on_settled,
     )
