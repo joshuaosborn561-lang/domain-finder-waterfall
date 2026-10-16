@@ -142,10 +142,16 @@ def receipt_test(
                 on_progress=_tick,
             )
             hits = wrong = none = 0
+            accepted_by_title = 0
+            rejected_by_gate: dict[str, int] = {}
             for row in sample:
                 key = str(row["_source_key"])
                 cand = result.candidates.get(key)
-                if not cand:
+                for prior in result.rejected.get(key) or []:
+                    if isinstance(prior, dict) and prior.get("reason"):
+                        reason = str(prior["reason"])
+                        rejected_by_gate[reason] = rejected_by_gate.get(reason, 0) + 1
+                if not cand or not cand.domain:
                     none += 1
                     continue
                 gate = evaluate(
@@ -156,10 +162,15 @@ def receipt_test(
                     title=cand.title,
                     phone=cand.phone or "",
                     address_state=cand.address_state or "",
+                    city=str(row.get("city") or cand.address_city or ""),
+                    input_state=str(row.get("state") or ""),
                 )
                 if not gate.accepted:
-                    none += 1
+                    if gate.reason:
+                        rejected_by_gate[gate.reason] = rejected_by_gate.get(gate.reason, 0) + 1
                     continue
+                if gate.accepted_by_title:
+                    accepted_by_title += 1
                 if _match(str(row.get("_truth_domain") or ""), gate.domain):
                     hits += 1
                     guessed[key] = gate.domain
@@ -172,6 +183,8 @@ def receipt_test(
                     "hits": hits,
                     "wrong": wrong,
                     "none": none,
+                    "accepted_by_title": accepted_by_title,
+                    "rejected_by_gate": dict(rejected_by_gate),
                     "hit_rate": round(rate, 4),
                     "cost_usd": round(result.cost_usd, 6),
                     "credits": result.credits,
@@ -192,6 +205,8 @@ def receipt_test(
                         "hits": hits,
                         "wrong": wrong,
                         "none": none,
+                        "accepted_by_title": accepted_by_title,
+                        "rejected_by_gate": dict(rejected_by_gate),
                     }
                 )
         return per_tier
@@ -226,6 +241,22 @@ def receipt_test(
             patch["tier_order"] = new_order.as_profile()
         update_profile_fields(profile.client_tag, patch)
 
+    def _sum_title(rows: list[dict[str, Any]]) -> int:
+        return sum(int(r.get("accepted_by_title") or 0) for r in rows)
+
+    def _sum_reasons(rows: list[dict[str, Any]]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for row in rows:
+            blob = row.get("rejected_by_gate") or {}
+            if not isinstance(blob, dict):
+                continue
+            for key, val in blob.items():
+                try:
+                    out[str(key)] = out.get(str(key), 0) + int(val)
+                except (TypeError, ValueError):
+                    continue
+        return out
+
     return {
         "ok": True,
         "client_tag": profile.client_tag,
@@ -236,6 +267,8 @@ def receipt_test(
         "spent_usd": round(sum(t["cost_usd"] for t in with_geo + without_geo), 4),
         "with_location": with_geo,
         "without_location": without_geo,
+        "accepted_by_title": _sum_title(with_geo),
+        "rejected_by_gate": _sum_reasons(with_geo),
         "dropped_tiers": dropped,
         "hit_rates": hit_rates,
         "tier_order": new_order.as_profile(),

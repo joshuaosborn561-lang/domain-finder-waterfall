@@ -152,6 +152,134 @@ def test_industry_allow() -> None:
     assert hit.accepted
 
 
+def _contractor(states: list[str] | None = None) -> ProfileGate:
+    return ProfileGate(
+        name_strip_tokens=[
+            "inc",
+            "llc",
+            "ltd",
+            "co",
+            "corp",
+            "company",
+            "group",
+            "services",
+            "construction",
+            "contractors",
+            "builders",
+        ],
+        states=list(states or []),
+        geo_required=True,
+        tld_allow=[".com", ".net", ".org", ".us", ".co", ".io", ".biz"],
+    )
+
+
+def test_initials_and_title_prather() -> None:
+    gate = _contractor(["TX"])
+    out = evaluate(
+        gate,
+        input_name="Prather & Harlan",
+        domain="ph-ac.com",
+        title="Prather & Harlan Heating and Air",
+        input_state="TX",
+    )
+    assert out.accepted
+    assert out.accepted_by_title
+    assert out.initials_match
+    assert out.title_match
+    assert not out.token_hit
+    assert out.status == "review"
+    assert out.confidence == 0.6
+
+
+def test_initials_and_title_farrell() -> None:
+    gate = _contractor(["FL"])
+    out = evaluate(
+        gate,
+        input_name="John Farrell Construction",
+        domain="jfconstfl.com",
+        title="John Farrell Construction, Tampa",
+        input_state="FL",
+        city="Tampa",
+    )
+    assert out.accepted
+    assert out.accepted_by_title
+    assert out.initials_match
+    assert out.title_match
+    assert not out.token_hit
+    assert out.status == "review"
+    assert out.confidence == 0.6
+
+
+def test_token_path_gill_unchanged() -> None:
+    gate = _contractor(["PA"])
+    out = evaluate(
+        gate,
+        input_name="Gill Construction",
+        domain="gillconstructioninc.com",
+        title="Anything at all",
+        input_state="PA",
+    )
+    assert out.accepted
+    assert out.token_hit
+    assert not out.accepted_by_title
+    assert out.status == "resolved"
+    assert out.confidence >= 0.7
+
+
+def test_blocklist_smith_yelp() -> None:
+    gate = _contractor(["TX"])
+    out = evaluate(
+        gate,
+        input_name="Smith Roofing",
+        domain="yelp.com",
+        title="Smith Roofing, Yelp",
+        input_state="TX",
+    )
+    assert not out.accepted
+    assert out.reason == "blocklist"
+
+
+def test_title_alone_does_not_accept_unrelated_domain() -> None:
+    gate = _contractor(["TX"])
+    out = evaluate(
+        gate,
+        input_name="Smith Roofing",
+        domain="acmeplumbing.com",
+        title="Acme Plumbing Dallas",
+        input_state="TX",
+    )
+    assert not out.accepted
+    assert out.reason == "token"
+
+
+def test_token_path_geo_state_from_title() -> None:
+    gate = _contractor(["TX"])
+    out = evaluate(
+        gate,
+        input_name="Smith Roofing",
+        domain="smithroofingco.com",
+        title="Smith Roofing Phoenix AZ",
+        input_state="TX",
+    )
+    assert not out.accepted
+    assert out.reason == "geo_state"
+
+
+def test_initials_plus_title_geo_ok_resolves() -> None:
+    gate = _contractor(["TX"])
+    out = evaluate(
+        gate,
+        input_name="Prather & Harlan",
+        domain="ph-ac.com",
+        title="Prather & Harlan Heating and Air TX",
+        input_state="TX",
+    )
+    assert out.accepted
+    assert out.accepted_by_title
+    assert out.status == "resolved"
+    assert out.confidence == 0.8
+
+
 def test_sinks() -> None:
     sinks = find_sinks(
         {

@@ -60,3 +60,5 @@ class TierResult:
     errored: int = 0
     # Explicit billing fields so free tiers do not look like uncounted spend.
     billing: str = ""
+    # Gate rejects collected inside a vendor (e.g. SERP top-N walk), keyed by row.
+    rejected: dict[str, list[dict[str, Any]]] = field(default_factory=dict)

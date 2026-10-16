@@ -269,6 +269,7 @@ def _run_tier(
             deadline=deadline,
             should_stop=should_stop,
             concurrency=concurrency,
+            profile=profile,
         )
     if name == "prospeo":
         return prospeo.resolve_rows(
@@ -456,9 +457,28 @@ def resolve_domain(
     deferred_tier = ""
     tier_stats: list[dict[str, Any]] = []
     guessed: dict[str, str] = {}
+    accepted_by_title_total = 0
+    rejected_by_reason_total: dict[str, int] = {}
 
     def stopped() -> bool:
         return bool(should_stop and should_stop())
+
+    def _record_rejected(st: dict[str, Any], payload: dict[str, Any]) -> None:
+        reason = str(payload.get("reason") or "")
+        if reason:
+            rejected_by_reason_total[reason] = rejected_by_reason_total.get(reason, 0) + 1
+        cands = st.setdefault("candidates", [])
+        if not isinstance(cands, list):
+            cands = []
+            st["candidates"] = cands
+        cands.append(
+            {
+                "domain": payload.get("domain") or "",
+                "tier": payload.get("tier") or "",
+                "title": payload.get("title") or "",
+                "reason": reason,
+            }
+        )
 
     def emit(extra: dict[str, Any] | None = None) -> None:
         if not progress:
@@ -474,6 +494,8 @@ def resolve_domain(
             "review": sum(1 for s in states.values() if s["status"] == "review"),
             "deferred": sum(1 for s in states.values() if s["status"] == "deferred"),
             "unresolved": sum(1 for s in states.values() if s["status"] in (None, "domain_unresolved")),
+            "accepted_by_title": accepted_by_title_total,
+            "rejected_by_gate": dict(rejected_by_reason_total),
             "tiers": tier_stats,
             "last_progress_at": utc_now_iso(),
         }
@@ -615,10 +637,28 @@ def resolve_domain(
         hits = wrong = 0  # populated by receipt; here just accepted/rejected
         accepted = 0
         rejected = 0
+        accepted_by_title = 0
+        rejected_reasons: dict[str, int] = {}
         for row in targets:
             key = str(row["_source_key"])
+            st = states[key]
             cand = result.candidates.get(key)
-            if not cand:
+            for prior in result.rejected.get(key) or []:
+                if isinstance(prior, dict):
+                    rejected += 1
+                    reason = str(prior.get("reason") or "")
+                    if reason:
+                        rejected_reasons[reason] = rejected_reasons.get(reason, 0) + 1
+                    _record_rejected(
+                        st,
+                        {
+                            "domain": prior.get("domain") or "",
+                            "tier": prior.get("tier") or tier_name,
+                            "title": prior.get("title") or "",
+                            "reason": reason,
+                        },
+                    )
+            if not cand or not cand.domain:
                 continue
             gate = evaluate(
                 profile.gate(),
@@ -628,11 +668,27 @@ def resolve_domain(
                 title=cand.title,
                 phone=cand.phone or "",
                 address_state=cand.address_state or "",
+                city=str(row.get("city") or cand.address_city or ""),
+                input_state=str(row.get("state") or ""),
             )
             if not gate.accepted:
                 rejected += 1
+                if gate.reason:
+                    rejected_reasons[gate.reason] = rejected_reasons.get(gate.reason, 0) + 1
+                _record_rejected(
+                    st,
+                    {
+                        "domain": gate.domain or cand.domain,
+                        "tier": tier_name,
+                        "title": cand.title,
+                        "reason": gate.reason,
+                    },
+                )
                 continue
             accepted += 1
+            if gate.accepted_by_title:
+                accepted_by_title += 1
+                accepted_by_title_total += 1
             accepted_rows.append(
                 {
                     "key": key,
@@ -667,7 +723,8 @@ def resolve_domain(
                 st["source"] = f"{st['source']}+{tier_name}"
             elif existing and extract_domain(existing) != domain:
                 st["status"] = "review"
-                st["candidates"] = [
+                prior = [c for c in (st.get("candidates") or []) if isinstance(c, dict)]
+                st["candidates"] = prior + [
                     {"domain": existing, "source": st.get("source"), "confidence": st.get("confidence")},
                     {"domain": domain, "source": tier_name, "confidence": gate.confidence},
                 ]
@@ -684,7 +741,9 @@ def resolve_domain(
                 "tier": tier_name,
                 "targets": len(targets),
                 "accepted": accepted,
+                "accepted_by_title": accepted_by_title,
                 "rejected_by_gate": rejected,
+                "rejected_by_gate_reasons": dict(rejected_reasons),
                 "none": result.none,
                 "errored": result.errored,
                 "cost_usd": round(result.cost_usd, 6),
@@ -729,6 +788,8 @@ def resolve_domain(
         "domain_unresolved": 0,
         "agreement": 0,
         "at_or_above_0_7": 0,
+        "accepted_by_title": accepted_by_title_total,
+        "rejected_by_gate": dict(rejected_by_reason_total),
     }
 
     pending_keys: list[str] = []
@@ -760,6 +821,8 @@ def resolve_domain(
         "spent_usd": round(spent, 4),
         "approve_cost_usd": approve_cost_usd,
         "counts": counts,
+        "accepted_by_title": accepted_by_title_total,
+        "rejected_by_gate": dict(rejected_by_reason_total),
         "agreement_rate": round(counts["agreement"] / n, 4) if n else 0.0,
         "tiers": tier_stats,
         "tier_order": order.as_profile(),

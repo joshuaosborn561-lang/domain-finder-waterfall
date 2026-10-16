@@ -274,3 +274,75 @@ def test_writeback_flushes_after_each_tier(monkeypatch: pytest.MonkeyPatch) -> N
     assert patches[0][1]["wf_domain"] == "acme.com"
     assert patches[0][1]["wf_domain_source"] == "cache"
     assert patches[0][1]["wf_domain_status"] == "resolved"
+
+
+def test_unresolved_keeps_gate_rejected_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    from domain_waterfall import waterfall as wf
+
+    profile = ClientProfile(
+        client_tag="t",
+        raw={
+            "enabled_tiers": ["cache"],
+            "geo": {"geo_required": False, "states": ["TX"]},
+            "name_strip_tokens": ["inc", "llc", "construction"],
+        },
+    )
+    monkeypatch.setattr(wf, "get_profile", lambda _tag: profile)
+    monkeypatch.setattr(wf, "hydrate_keys", lambda: {})
+    monkeypatch.setattr(wf, "live_prices", lambda: ({"cache": 0.0, "maps": 0.0}, {}))
+    fetched = FetchResult(
+        rows=[
+            {
+                "_source_key": "1",
+                "company_name": "Smith Roofing",
+                "city": "Dallas",
+                "state": "TX",
+                "phone": "",
+            }
+        ],
+        rows_matched=1,
+        rows_fetched=1,
+        rows_excluded=0,
+        exclusion_reasons={},
+    )
+    monkeypatch.setattr(wf, "fetch_source_rows", lambda _src: fetched)
+    monkeypatch.setattr(wf, "count_source_rows", lambda _src: fetched.rows_matched)
+    monkeypatch.setattr(wf, "ensure_writeback", lambda _src: None)
+    monkeypatch.setattr(wf, "defer_unfetched", lambda *_a, **_k: 0)
+
+    patches: list[tuple[str, dict[str, Any]]] = []
+
+    def capture_patch(_src: Any, key: str, fields: dict[str, Any]) -> None:
+        patches.append((key, dict(fields)))
+
+    monkeypatch.setattr(wf, "patch_source_row", capture_patch)
+
+    def fake_run(name: str, rows: list[dict[str, Any]], *_a: Any, **_k: Any) -> TierResult:
+        return TierResult(
+            tier=name,
+            candidates={"1": DomainCandidate(domain="yelp.com", title="Smith Roofing, Yelp")},
+            rows_done=len(rows),
+        )
+
+    monkeypatch.setattr(wf, "_run_tier", fake_run)
+    out = resolve_domain(
+        source_table="public.t",
+        where="domain is null",
+        client_tag="t",
+        writeback=True,
+        max_tier="cache",
+    )
+    assert out["counts"]["domain_unresolved"] == 1
+    assert out["rejected_by_gate"].get("blocklist") == 1
+    assert patches
+    last = patches[-1][1]
+    assert last["wf_domain_status"] == "domain_unresolved"
+    cands = last["wf_domain_candidates"]
+    assert isinstance(cands, list) and cands
+    assert cands[0]["domain"] == "yelp.com"
+    assert cands[0]["reason"] == "blocklist"
+    assert cands[0]["tier"] == "cache"
+    assert "title" in cands[0]
+    banned = {"dl_status", "sg_exclude"}
+    assert banned.isdisjoint(last)
+    assert all(not k.startswith("skip_") for k in last)

@@ -76,6 +76,105 @@ GLOBAL_BLOCKLIST = frozenset(
 DEFAULT_TLDS = (".com", ".net", ".org", ".us", ".co", ".io", ".biz")
 SINK_THRESHOLD = 3
 
+# Used only for the one-token title path (token + trade word or city).
+TRADE_WORDS = frozenset(
+    {
+        "heating",
+        "air",
+        "hvac",
+        "plumbing",
+        "plumb",
+        "roofing",
+        "roof",
+        "electric",
+        "electrical",
+        "construction",
+        "contractor",
+        "contractors",
+        "builder",
+        "builders",
+        "painting",
+        "paint",
+        "concrete",
+        "fencing",
+        "fence",
+        "landscape",
+        "landscaping",
+        "excavating",
+        "excavation",
+        "remodeling",
+        "remodel",
+        "restoration",
+        "insulation",
+        "flooring",
+        "masonry",
+        "carpentry",
+        "welding",
+        "paving",
+        "siding",
+        "drywall",
+        "mechanical",
+        "cooling",
+        "refrigeration",
+    }
+)
+
+_US_STATE_ABBR = frozenset(
+    {
+        "al",
+        "ak",
+        "az",
+        "ar",
+        "ca",
+        "co",
+        "ct",
+        "de",
+        "dc",
+        "fl",
+        "ga",
+        "hi",
+        "id",
+        "il",
+        "in",
+        "ia",
+        "ks",
+        "ky",
+        "la",
+        "me",
+        "md",
+        "ma",
+        "mi",
+        "mn",
+        "ms",
+        "mo",
+        "mt",
+        "ne",
+        "nv",
+        "nh",
+        "nj",
+        "nm",
+        "ny",
+        "nc",
+        "nd",
+        "oh",
+        "ok",
+        "or",
+        "pa",
+        "ri",
+        "sc",
+        "sd",
+        "tn",
+        "tx",
+        "ut",
+        "vt",
+        "va",
+        "wa",
+        "wv",
+        "wi",
+        "wy",
+    }
+)
+
 
 @dataclass
 class GateResult:
@@ -88,6 +187,9 @@ class GateResult:
     geo_signal: bool = False
     confidence: float = 0.0
     status: str = ""  # resolved | review | ""
+    accepted_by_title: bool = False
+    title_match: bool = False
+    initials_match: bool = False
 
 
 @dataclass
@@ -138,6 +240,57 @@ def _matches_block(label: str, exact: set[str], prefixes: list[str]) -> bool:
     return any(label.startswith(p) for p in prefixes if p)
 
 
+def _whole_word(token: str, text: str) -> bool:
+    if not token or not text:
+        return False
+    return bool(re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", text, re.I))
+
+
+def title_has_all_tokens(title: str, tokens: list[str]) -> bool:
+    """True when the title contains every distinctive token as a whole word."""
+    if not tokens:
+        return False
+    text = title or ""
+    return all(_whole_word(tok, text) for tok in tokens)
+
+
+def domain_starts_with_initials(name_part: str, tokens: list[str]) -> bool:
+    """True when the registrable label starts with the first two token initials."""
+    if len(tokens) < 2:
+        return False
+    initials = f"{tokens[0][0]}{tokens[1][0]}".lower()
+    raw = (name_part or "").lower()
+    compact = re.sub(r"[^a-z0-9]", "", raw)
+    return raw.startswith(initials) or compact.startswith(initials)
+
+
+def _state_from_title(title: str) -> str:
+    """Last uppercase 2-letter USPS code in the title. Ignores lowercase 'in'/'or'."""
+    found = [
+        tok.lower()
+        for tok in re.findall(r"\b[A-Z]{2}\b", title or "")
+        if tok.lower() in _US_STATE_ABBR
+    ]
+    return found[-1] if found else ""
+
+
+def _one_token_title_extra(
+    title: str,
+    city: str,
+    input_name: str,
+    strip_tokens: list[str],
+) -> bool:
+    if city and _whole_word(city.strip(), title or ""):
+        return True
+    extras = set(TRADE_WORDS)
+    name_norm = (input_name or "").lower()
+    for raw in strip_tokens:
+        tok = str(raw or "").strip().lower()
+        if tok and tok in name_norm:
+            extras.add(tok)
+    return any(_whole_word(word, title or "") for word in extras if word)
+
+
 def is_blocklisted(domain: str, blocklist: Iterable[str]) -> bool:
     host = extract_domain(domain)
     if not host:
@@ -159,6 +312,8 @@ def evaluate(
     title: str = "",
     phone: str = "",
     address_state: str = "",
+    city: str = "",
+    input_state: str = "",
 ) -> GateResult:
     host = extract_domain(domain)
     if not host:
@@ -173,12 +328,26 @@ def evaluate(
 
     tokens = distinctive_tokens(input_name, profile.name_strip_tokens)
     name_part = domain_name_part(host)
-    # Title/snippet must not count. SERP titles include the company on directory pages.
     token_on_domain = any(tok in name_part for tok in tokens) if tokens else False
     token_on_vendor = any(tok in (vendor_name or "").lower() for tok in tokens) if tokens else False
     token_hit = token_on_domain
-    if tokens and not token_on_domain:
-        return GateResult(False, domain=host, reason="token")
+    title_match = title_has_all_tokens(title, tokens)
+    initials_only = domain_starts_with_initials(name_part, tokens)
+    initials_match = bool(initials_only and title_match)
+    one_token_ok = bool(
+        len(tokens) == 1
+        and title_match
+        and _one_token_title_extra(title, city, input_name, profile.name_strip_tokens)
+    )
+    second_path = bool(tokens and not token_on_domain and (initials_match or one_token_ok))
+    if tokens and not token_on_domain and not second_path:
+        return GateResult(
+            False,
+            domain=host,
+            reason="token",
+            title_match=title_match,
+            initials_match=initials_match,
+        )
 
     industry_text = _blob(host, vendor_name, title)
     reject = _compile(profile.industry_reject_regex)
@@ -187,6 +356,9 @@ def evaluate(
     allow = _compile(profile.industry_allow_regex)
     if allow and not allow.search(industry_text):
         return GateResult(False, domain=host, reason="industry_allow")
+
+    if not address_state:
+        address_state = _state_from_title(title)
 
     geo_signal = False
     geo_ok = False
@@ -208,11 +380,38 @@ def evaluate(
                 return GateResult(False, domain=host, reason="geo_state")
         if state_ok:
             geo_ok = True
+    if input_state and address_state:
+        geo_signal = True
+        if normalize_state(input_state) != normalize_state(address_state):
+            return GateResult(False, domain=host, reason="geo_state")
+        geo_ok = True
 
     if not geo_signal:
         # No phone/address came back — national profiles cap, required profiles reject? Spec:
         # "If neither signal came back, cap at 0.7."
         geo_ok = False
+
+    if second_path:
+        if geo_ok:
+            confidence = 0.8
+            status = "resolved"
+        else:
+            confidence = 0.6
+            status = "review"
+        return GateResult(
+            accepted=True,
+            domain=host,
+            reason="ok",
+            token_hit=False,
+            token_on_vendor_name=token_on_vendor,
+            geo_ok=geo_ok,
+            geo_signal=geo_signal,
+            confidence=confidence,
+            status=status,
+            accepted_by_title=True,
+            title_match=title_match,
+            initials_match=initials_match,
+        )
 
     if token_on_domain and (token_on_vendor or geo_ok):
         confidence = 0.9
@@ -246,6 +445,8 @@ def evaluate(
         geo_signal=geo_signal,
         confidence=confidence,
         status=status,
+        title_match=title_match,
+        initials_match=initials_match,
     )
 
 

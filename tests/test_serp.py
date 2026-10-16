@@ -37,8 +37,83 @@ def test_organic_skips_blocklisted_and_requires_name_tokens() -> None:
             {"link": "https://acmeplumbing.com", "title": "Acme Plumbing"},
         ]
     }
-    domain, _title = serp._domain_from_organic(item, company_name="Acme Plumbing")
+    domain, _title, rejected = serp._domain_from_organic(item, company_name="Acme Plumbing")
     assert domain == "acmeplumbing.com"
+    assert any(r.get("reason") == "token" for r in rejected)
+
+
+def test_organic_walks_to_initials_title_hit() -> None:
+    from domain_waterfall.gate import ProfileGate
+
+    gate = ProfileGate(
+        name_strip_tokens=["inc", "llc", "construction", "contractors", "builders"],
+        states=["TX"],
+        geo_required=True,
+    )
+    item = {
+        "organic": [
+            {"link": "https://yelp.com/biz/1", "title": "Prather & Harlan Heating and Air"},
+            {"link": "https://otherco.com", "title": "Prather & Harlan Heating and Air"},
+            {"link": "https://ph-ac.com", "title": "Prather & Harlan Heating and Air"},
+        ]
+    }
+    domain, title, rejected = serp._domain_from_organic(
+        item,
+        company_name="Prather & Harlan",
+        profile=gate,
+        input_state="TX",
+    )
+    assert domain == "ph-ac.com"
+    assert "Prather" in title
+    assert any(r.get("domain") == "otherco.com" and r.get("reason") == "token" for r in rejected)
+
+
+def test_organic_accepts_initials_title_first_hit() -> None:
+    from domain_waterfall.gate import ProfileGate
+
+    gate = ProfileGate(
+        name_strip_tokens=["inc", "llc", "construction", "contractors", "builders"],
+        states=["FL"],
+        geo_required=True,
+    )
+    item = {
+        "organic": [
+            {"link": "https://jfconstfl.com", "title": "John Farrell Construction, Tampa"},
+        ]
+    }
+    domain, title, rejected = serp._domain_from_organic(
+        item,
+        company_name="John Farrell Construction",
+        profile=gate,
+        city="Tampa",
+        input_state="FL",
+    )
+    assert domain == "jfconstfl.com"
+    assert "Farrell" in title
+    assert rejected == []
+
+
+def test_organic_stops_after_five_non_blocklisted() -> None:
+    from domain_waterfall.gate import ProfileGate
+
+    gate = ProfileGate(
+        name_strip_tokens=["inc", "llc", "construction"],
+        states=["TX"],
+        geo_required=True,
+    )
+    organic = [
+        {"link": f"https://other{i}.com", "title": "Prather & Harlan Heating and Air"}
+        for i in range(5)
+    ]
+    organic.append({"link": "https://ph-ac.com", "title": "Prather & Harlan Heating and Air"})
+    domain, _title, rejected = serp._domain_from_organic(
+        {"organic": organic},
+        company_name="Prather & Harlan",
+        profile=gate,
+        input_state="TX",
+    )
+    assert domain == ""
+    assert len(rejected) == 5
 
 
 def test_missing_key_skips_without_http(monkeypatch: pytest.MonkeyPatch) -> None:
