@@ -176,6 +176,28 @@ class ClientProfile:
         val = self.raw.get("name_reject_regex")
         return str(val) if val else None
 
+    @property
+    def discolike_min_confidence(self) -> int:
+        val = self.raw.get("discolike_min_confidence", 60)
+        try:
+            n = int(val)
+        except (TypeError, ValueError):
+            n = 60
+        return max(0, min(100, n))
+
+    @property
+    def discolike_strict(self) -> bool:
+        return bool(self.raw.get("discolike_strict", False))
+
+    @property
+    def discolike_chunk_size(self) -> int:
+        val = self.raw.get("discolike_chunk_size", 500)
+        try:
+            n = int(val)
+        except (TypeError, ValueError):
+            n = 500
+        return max(1, min(1000, n))
+
     def gate(self) -> ProfileGate:
         return ProfileGate(
             name_strip_tokens=self.name_strip_tokens,

@@ -273,6 +273,8 @@ def _run_tier(
             with_location=True,
             on_progress=on_progress,
             on_settled=on_settled,
+            profile=profile,
+            chunk_size=profile.discolike_chunk_size,
         )
     if name == "serp":
         return serp.resolve_rows(
@@ -711,6 +713,7 @@ def resolve_domain(
         tier_name: str,
         rejected_list: list[Any] | None,
         ctx: dict[str, Any],
+        deferred: bool = False,
     ) -> None:
         if key in ctx["settled_keys"] or key not in states:
             return
@@ -719,6 +722,11 @@ def resolve_domain(
         if not row:
             return
         st = states[key]
+        if deferred:
+            if st["status"] in (None, "", "domain_unresolved"):
+                st["status"] = "deferred"
+                streamer.enqueue(key)
+            return
         for prior in rejected_list or []:
             if not isinstance(prior, dict):
                 continue
@@ -799,6 +807,7 @@ def resolve_domain(
         key: str,
         candidate: DomainCandidate | None,
         rejected: list[Any] | None = None,
+        deferred: bool = False,
         **_kwargs: Any,
     ) -> None:
         ctx = tier_ctx
@@ -811,6 +820,7 @@ def resolve_domain(
                 tier_name=str(ctx.get("tier") or ""),
                 rejected_list=rejected,
                 ctx=ctx,
+                deferred=deferred or bool(_kwargs.get("deferred")),
             )
 
     streamer = StreamingWriteback(
@@ -929,6 +939,18 @@ def resolve_domain(
             spent += result.cost_usd
 
             with settle_lock:
+                for raw_key in result.deferred_keys:
+                    key = str(raw_key)
+                    if key in tier_ctx["settled_keys"]:
+                        continue
+                    settle_vendor_row(
+                        key,
+                        None,
+                        tier_name=tier_name,
+                        rejected_list=result.rejected.get(key),
+                        ctx=tier_ctx,
+                        deferred=True,
+                    )
                 for row in targets:
                     key = str(row["_source_key"])
                     if key in tier_ctx["settled_keys"]:

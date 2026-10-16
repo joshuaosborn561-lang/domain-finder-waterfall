@@ -97,5 +97,80 @@ def e164_us(phone: str) -> str:
     return (phone or "").strip()
 
 
+# Official names → USPS. DiscoLike returns "Florida"; source rows store "FL".
+_US_STATE_NAMES: dict[str, str] = {
+    "alabama": "al",
+    "alaska": "ak",
+    "arizona": "az",
+    "arkansas": "ar",
+    "california": "ca",
+    "colorado": "co",
+    "connecticut": "ct",
+    "delaware": "de",
+    "district of columbia": "dc",
+    "florida": "fl",
+    "georgia": "ga",
+    "hawaii": "hi",
+    "idaho": "id",
+    "illinois": "il",
+    "indiana": "in",
+    "iowa": "ia",
+    "kansas": "ks",
+    "kentucky": "ky",
+    "louisiana": "la",
+    "maine": "me",
+    "maryland": "md",
+    "massachusetts": "ma",
+    "michigan": "mi",
+    "minnesota": "mn",
+    "mississippi": "ms",
+    "missouri": "mo",
+    "montana": "mt",
+    "nebraska": "ne",
+    "nevada": "nv",
+    "new hampshire": "nh",
+    "new jersey": "nj",
+    "new mexico": "nm",
+    "new york": "ny",
+    "north carolina": "nc",
+    "north dakota": "nd",
+    "ohio": "oh",
+    "oklahoma": "ok",
+    "oregon": "or",
+    "pennsylvania": "pa",
+    "puerto rico": "pr",
+    "rhode island": "ri",
+    "south carolina": "sc",
+    "south dakota": "sd",
+    "tennessee": "tn",
+    "texas": "tx",
+    "utah": "ut",
+    "vermont": "vt",
+    "virginia": "va",
+    "washington": "wa",
+    "west virginia": "wv",
+    "wisconsin": "wi",
+    "wyoming": "wy",
+}
+
+US_STATE_ABBR = frozenset(_US_STATE_NAMES.values())
+_US_STATE_COMPACT = {re.sub(r"[^a-z]", "", name): abbr for name, abbr in _US_STATE_NAMES.items()}
+
+
 def normalize_state(value: str) -> str:
-    return re.sub(r"[^a-z]", "", (value or "").lower())
+    """Map a US state (full name or code, any case) to a 2-letter USPS code.
+
+    "Florida" and "FL" both become "fl". Unknown input is letters-only lowercase.
+    """
+    text = (value or "").strip().lower()
+    if not text:
+        return ""
+    spaced = re.sub(r"[^a-z]+", " ", text).strip()
+    compact = spaced.replace(" ", "")
+    if compact in US_STATE_ABBR:
+        return compact
+    if spaced in _US_STATE_NAMES:
+        return _US_STATE_NAMES[spaced]
+    if compact in _US_STATE_COMPACT:
+        return _US_STATE_COMPACT[compact]
+    return compact

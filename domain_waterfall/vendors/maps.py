@@ -204,7 +204,7 @@ def _pick_phone(row: dict[str, Any]) -> str:
 
 
 def _pick_state(row: dict[str, Any], fallback: str = "") -> str:
-    from domain_waterfall.gate import _US_STATE_ABBR
+    from domain_waterfall.normalize import US_STATE_ABBR
 
     for key in ("state", "address_state", "region"):
         val = row.get(key)
@@ -221,7 +221,7 @@ def _pick_state(row: dict[str, Any], fallback: str = "") -> str:
         found = [
             tok
             for tok in re.findall(r"\b[A-Z]{2}\b", addr)
-            if tok.lower() in _US_STATE_ABBR
+            if tok.lower() in US_STATE_ABBR
         ]
         if found:
             return found[-1]
